@@ -1,0 +1,116 @@
+# --------------------------------------------------------------------
+# Secrets & local environment
+# --------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+secrets.json
+
+# --------------------------------------------------------------------
+# Python
+# --------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artefacts
+build/
+dist/
+sdist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# Type checkers / linters / test caches
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+nosetests.xml
+.hypothesis/
+.tox/
+.nox/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# --------------------------------------------------------------------
+# Project-local data, logs, run artefacts
+# --------------------------------------------------------------------
+data/
+logs/
+*.log
+*.parquet
+*.csv
+*.feather
+*.arrow
+*.pkl
+*.pickle
+*.sqlite
+*.sqlite3
+*.db
+
+# Dashboard / runtime state dumps (keep `aera/dashboard/static/`)
+state_*.json
+trades_*.json
+fills_*.json
+
+# --------------------------------------------------------------------
+# IDE / editor
+# --------------------------------------------------------------------
+.idea/
+.vscode/
+!.vscode/settings.json.example
+*.swp
+*.swo
+*~
+.history/
+.cursorindex/
+.cursor-server/
+
+# --------------------------------------------------------------------
+# OS-level junk
+# --------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# --------------------------------------------------------------------
+# Misc
+# --------------------------------------------------------------------
+*.bak
+*.tmp
+*.orig
+node_modules/

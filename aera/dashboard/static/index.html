@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>aera · live trading dashboard</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop offset='0' stop-color='%2300e5a8'/><stop offset='1' stop-color='%2300a8ff'/></linearGradient></defs><rect width='32' height='32' rx='8' fill='url(%23g)'/><text x='6' y='24' font-size='22' font-family='ui-monospace,Menlo,monospace' font-weight='800' fill='%23031018'>æ</text></svg>" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <!-- ════════════════════════════════════════════════════════════════
+         topbar — sticky, glassmorphic
+         ════════════════════════════════════════════════════════════════ -->
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo" aria-hidden="true">æ</span>
+            <div class="brand-text">
+                <h1>aera</h1>
+                <p class="tagline">autonomous edge &amp; risk arbitrage · delta perps</p>
+            </div>
+        </div>
+        <div class="topbar-status">
+            <div class="status-pill" id="status-pill">
+                <span class="dot"></span>
+                <span id="status-label">connecting…</span>
+            </div>
+            <div class="status-pill mode" id="mode-pill">PAPER</div>
+            <div class="status-pill" id="uptime-pill">uptime <b id="uptime">0s</b></div>
+            <div class="status-pill" id="ws-pill"><span id="ws-badge">REST</span></div>
+            <button id="btn-pause" class="ctl ctl-pause" type="button">Pause</button>
+            <button id="btn-resume" class="ctl ctl-resume hidden" type="button">Resume</button>
+        </div>
+    </header>
+
+    <main class="grid">
+
+        <!-- ════════════════════════════════════════════════════════════
+             HERO — primary portfolio glance
+             ════════════════════════════════════════════════════════════ -->
+        <section class="card hero">
+            <div class="hero-headline">
+                <div class="hero-left">
+                    <div class="hero-label">portfolio value</div>
+                    <div class="hero-value" id="hero-equity">$—</div>
+                    <div class="hero-meta">
+                        <span class="meta-chip" id="hero-delta">—</span>
+                        <span class="meta-chip muted" id="hero-start">start $—</span>
+                        <span class="meta-chip muted" id="hero-peak">peak $—</span>
+                    </div>
+                </div>
+                <div class="hero-right">
+                    <div class="hero-spark"><canvas id="heroSpark"></canvas></div>
+                </div>
+            </div>
+
+            <div class="hero-strip">
+                <div class="strip">
+                    <div class="strip-label">bankroll</div>
+                    <div class="strip-value" id="strip-bankroll">$—</div>
+                    <div class="strip-sub" id="strip-bankroll-sub">free cash</div>
+                </div>
+                <div class="strip">
+                    <div class="strip-label">locked margin</div>
+                    <div class="strip-value" id="strip-margin">$—</div>
+                    <div class="strip-sub" id="strip-margin-sub">posted</div>
+                </div>
+                <div class="strip">
+                    <div class="strip-label">settled wealth</div>
+                    <div class="strip-value" id="strip-settled">$—</div>
+                    <div class="strip-sub" id="strip-settled-sub">excl. unrealised</div>
+                </div>
+                <div class="strip">
+                    <div class="strip-label">buying power</div>
+                    <div class="strip-value" id="strip-bp">$—</div>
+                    <div class="strip-sub" id="strip-bp-sub">@ —x lev</div>
+                </div>
+                <div class="strip">
+                    <div class="strip-label">growth</div>
+                    <div class="strip-value" id="strip-growth">—x</div>
+                    <div class="strip-sub" id="strip-growth-sub">vs start</div>
+                </div>
+                <div class="strip">
+                    <div class="strip-label">drawdown</div>
+                    <div class="strip-value" id="strip-dd">—%</div>
+                    <div class="strip-sub" id="strip-dd-sub">streak —</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ════════════════════════════════════════════════════════════
+             KPI ribbon — secondary performance metrics
+             ════════════════════════════════════════════════════════════ -->
+        <section class="card kpis">
+            <div class="kpi">
+                <div class="kpi-label">realised p&amp;l</div>
+                <div class="kpi-value" id="kpi-realised">$—</div>
+                <div class="kpi-sub" id="kpi-realised-sub">net closed</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">win rate</div>
+                <div class="kpi-value" id="kpi-winrate">—%</div>
+                <div class="kpi-sub" id="kpi-winrate-sub">— W / — L</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">profit factor</div>
+                <div class="kpi-value" id="kpi-pf">—</div>
+                <div class="kpi-sub" id="kpi-pf-sub">gross +/−</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">expectancy</div>
+                <div class="kpi-value" id="kpi-exp">$—</div>
+                <div class="kpi-sub" id="kpi-exp-sub">per trade</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">avg win / loss</div>
+                <div class="kpi-value" id="kpi-awl">$— / $—</div>
+                <div class="kpi-sub" id="kpi-awl-sub">closed only</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">avg hold</div>
+                <div class="kpi-value" id="kpi-hold">—</div>
+                <div class="kpi-sub">round-trip</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">trades</div>
+                <div class="kpi-value" id="kpi-trades">—</div>
+                <div class="kpi-sub"><span id="kpi-trades-rej">—</span> rejected</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">signals</div>
+                <div class="kpi-value" id="kpi-signals">—</div>
+                <div class="kpi-sub"><span id="kpi-iters">—</span> iters</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">positions</div>
+                <div class="kpi-value" id="kpi-positions">—</div>
+                <div class="kpi-sub"><span id="kpi-markets">—</span> markets</div>
+            </div>
+        </section>
+
+        <!-- ════════════════════════════════════════════════════════════
+             CHART ROW 1 — equity curve + drawdown
+             ════════════════════════════════════════════════════════════ -->
+        <section class="card chart-card chart-wide">
+            <div class="card-header">
+                <h2>equity &amp; bankroll</h2>
+                <div class="legend">
+                    <span class="lg lg-equity">equity (mtm)</span>
+                    <span class="lg lg-settled">settled wealth</span>
+                    <span class="lg lg-bankroll">free bankroll</span>
+                </div>
+            </div>
+            <div class="chart-wrap"><canvas id="equityChart"></canvas></div>
+        </section>
+
+        <section class="card chart-card chart-narrow">
+            <div class="card-header">
+                <h2>drawdown</h2>
+                <span class="badge" id="dd-current">— %</span>
+            </div>
+            <div class="chart-wrap"><canvas id="ddChart"></canvas></div>
+        </section>
+
+        <!-- ════════════════════════════════════════════════════════════
+             CHART ROW 2 — cumulative P&L + win/loss donut + pnl histogram
+             ════════════════════════════════════════════════════════════ -->
+        <section class="card chart-card chart-half">
+            <div class="card-header">
+                <h2>cumulative realised p&amp;l</h2>
+                <span class="badge" id="cum-net">net $0.00</span>
+            </div>
+            <div class="chart-wrap"><canvas id="cumPnlChart"></canvas></div>
+        </section>
+
+        <section class="card chart-card chart-quarter">
+            <div class="card-header">
+                <h2>win / loss</h2>
+            </div>
+            <div class="chart-wrap chart-donut"><canvas id="winLossChart"></canvas></div>
+            <div class="donut-legend" id="wl-legend">
+                <span class="lg lg-up"><b id="wl-wins">0</b> wins</span>
+                <span class="lg lg-down"><b id="wl-losses">0</b> losses</span>
+            </div>
+        </section>
+
+        <section class="card chart-card chart-quarter">
+            <div class="card-header">
+                <h2>p&amp;l distribution</h2>
+            </div>
+            <div class="chart-wrap chart-donut"><canvas id="pnlDistChart"></canvas></div>
+        </section>
+
+        <!-- ════════════════════════════════════════════════════════════
+             CHART ROW 3 — strategy P&L bars + exposure donut
+             ════════════════════════════════════════════════════════════ -->
+        <section class="card chart-card chart-half">
+            <div class="card-header">
+                <h2>p&amp;l by strategy</h2>
+                <span class="badge muted">closed trades</span>
+            </div>
+            <div class="chart-wrap"><canvas id="strategyChart"></canvas></div>
+        </section>
+
+        <section class="card chart-card chart-half">
+            <div class="card-header">
+                <h2>position exposure</h2>
+                <span class="badge" id="exp-gross">gross $0</span>
+            </div>
+            <div class="chart-wrap chart-donut"><canvas id="exposureChart"></canvas></div>
+        </section>
+
+        <!-- ════════════════════════════════════════════════════════════
+             TABLES — open positions + completed trades
+             ════════════════════════════════════════════════════════════ -->
+        <section class="card list-card half">
+            <div class="card-header">
+                <h2>open positions <span class="muted" id="positions-count">0</span></h2>
+                <span class="badge" id="exp-net">net $0</span>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>market</th>
+                            <th>side</th>
+                            <th>shares</th>
+                            <th>avg cost</th>
+                            <th>realised</th>
+                            <th>notional</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positions-body">
+                        <tr class="empty"><td colspan="6">flat — no open positions</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card list-card half">
+            <div class="card-header">
+                <h2>strategy performance</h2>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>name</th>
+                            <th>signals</th>
+                            <th>exec</th>
+                            <th>rej</th>
+                            <th>avg edge</th>
+                            <th>pnl</th>
+                            <th>last</th>
+                        </tr>
+                    </thead>
+                    <tbody id="strategies-body">
+                        <tr class="empty"><td colspan="7">no strategies bound</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card list-card">
+            <div class="card-header">
+                <h2>completed trades <span class="muted" id="trades-count">0</span></h2>
+                <span class="badge" id="trades-pnl">net $0.00</span>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>closed</th>
+                            <th>strategy</th>
+                            <th>market</th>
+                            <th>side</th>
+                            <th>open</th>
+                            <th>close</th>
+                            <th>size</th>
+                            <th>p&amp;l</th>
+                            <th>held</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trades-body">
+                        <tr class="empty"><td colspan="9">no completed trades yet — open a position to start the round trip…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card list-card half">
+            <div class="card-header">
+                <h2>live fills <span class="muted" id="fills-count">0</span></h2>
+                <span class="badge" id="last-fill-ago">—</span>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>time</th>
+                            <th>strategy</th>
+                            <th>side</th>
+                            <th>price</th>
+                            <th>size</th>
+                            <th>notional</th>
+                            <th>bankroll →</th>
+                        </tr>
+                    </thead>
+                    <tbody id="fills-body">
+                        <tr class="empty"><td colspan="7">no fills yet — bot is scanning…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card list-card half">
+            <div class="card-header">
+                <h2>recent signals <span class="muted" id="signals-count">0</span></h2>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>time</th>
+                            <th>strategy</th>
+                            <th>edge</th>
+                            <th>legs</th>
+                            <th>notional</th>
+                            <th>status</th>
+                            <th>reason</th>
+                        </tr>
+                    </thead>
+                    <tbody id="signals-body">
+                        <tr class="empty"><td colspan="7">no signals yet — waiting on market data…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card list-card">
+            <div class="card-header">
+                <h2>top markets <span class="muted" id="markets-count">0</span></h2>
+            </div>
+            <div class="table-wrap">
+                <table class="data">
+                    <thead>
+                        <tr>
+                            <th>symbol</th>
+                            <th>category</th>
+                            <th>outcomes (bid / ask)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="markets-body">
+                        <tr class="empty"><td colspan="3">discovering markets…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>aera · autonomous edge &amp; risk arbitrage</span>
+        <span id="footer-info"></span>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

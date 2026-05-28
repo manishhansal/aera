@@ -1,0 +1,574 @@
+bot:
+  bankroll: 27.0                # starting USDC
+  paper: true                   # paper-trading mode (no real orders)
+  log_level: INFO
+  loop_interval_ms: 100         # scan cadence
+  # Counter-trade mode: when true, every strategy entry leg is flipped
+  # before submission (BUY -> SELL, SELL -> BUY). The bot fades its own
+  # strategies. Reduce-only legs (TP/SL/timeout closes + greedy flatten
+  # signals) are NEVER inverted — closes still close the actual position.
+  # Override per-run with BOT_INVERT_SIGNALS=true|false.
+  #
+  # DEFAULT FALSE: the strategies in this codebase were *tuned* for
+  # positive expectancy on Delta perps; inverting them turns +E into
+  # -E - 2×fees per trade (you eat the strategy's edge in reverse AND
+  # round-trip fees on every fire). Only flip to true if you have
+  # measured the strategies' live edge yourself and it is actually
+  # negative on your venue/market regime.
+  invert_signals: false
+
+risk:
+  kelly_fraction: 0.25          # fraction of full Kelly (0.25 = quarter-Kelly)
+  # Trade quantity = trade_size_fraction × buying_power (per trade), where
+  #   buying_power = bankroll × leverage
+  # For Delta perps at 50× leverage, a $20 bankroll has $1,000 of buying
+  # power, and trade_size_fraction = 0.5 produces a $500-notional order
+  # (~50 lots of a $10 perp like DOGEUSD) on $10 of margin.
+  #
+  # Set to 0.0 to fall back to "respect Kelly / strategy-emitted size, only
+  # scale down to fit max_trade_fraction" (the legacy behaviour).
+  trade_size_fraction: 0.50
+  # Hard ceiling — clamps trade_size_fraction. Same leverage-aware semantics.
+  # Must be >= trade_size_fraction.
+  max_trade_fraction: 0.50
+  # Per-market exposure cap, also scaled by leverage. On Delta @ 50× this is
+  # 0.50 × bankroll × 50 of notional allowed in one symbol.
+  #
+  # INVARIANT: must be >= max_trade_fraction. Otherwise the per-market cap is
+  # tighter than the per-trade cap and every single-market signal gets
+  # rejected on its first attempt (cumulative would-be exposure beats the
+  # per-market ceiling immediately). The settings loader emits a startup
+  # warning when this invariant is violated.
+  max_market_exposure: 0.50
+  # Tighter drawdown stop. 50% was a "don't blow the account" guardrail;
+  # 25% is a "this regime is not working, halt and let the user
+  # investigate" guardrail. The brain's daily-loss circuit-breaker
+  # below kicks in *before* this for a graceful halt on a single bad
+  # session; this is the hard kill that protects against a series of
+  # sessions all going wrong.
+  max_drawdown: 0.25
+  # Hard stop on consecutive losses across ALL strategies combined.
+  # Was 100 (effectively never). 6 is honest: at ~$5 realised loss per
+  # losing trade against a $20 bankroll that's $30 drawn from peak (≈
+  # 30% of an unleveraged base; less on the compounded buying power).
+  # The brain auto-mutes individual losing strategies at 4 in a row
+  # via ``max_strategy_loss_streak`` so this only trips on a
+  # cross-strategy meltdown.
+  max_consecutive_losses: 6
+
+execution:
+  # Taker fee applied to every paper-exchange fill (and reported by live
+  # exchanges from their commission field). Delta's taker fee is ~5 bps;
+  # set non-zero so paper P&L models real fees AND the greedy autopilot's
+  # TP math (target = round_trip_fees + $1) matches what live trading
+  # will actually produce. Override per-run with BOT_TAKER_FEE_BPS.
+  taker_fee_bps: 5.0
+  default_slippage_bps: 10      # assume 10 bps slippage on market orders
+  min_order_size_usd: 1.0
+  order_timeout_seconds: 30
+
+strategies:
+  delta_perp_scalper:
+    enabled: true
+    min_edge: 0.002
+    zscore_window: 60
+    # Tightened: 2.0 -> 2.5 (require deeper mean-reversion gravity)
+    # and 0.2 -> 0.35 OFI (stronger order-flow confirmation in the
+    # reversion direction). Fewer fires, higher edge per fire.
+    zscore_entry: 2.5
+    ofi_threshold: 0.35
+    # Reference notional emitted on each fire. In target mode
+    # (risk.trade_size_fraction > 0) the executor REPLACES this with
+    # `trade_size_fraction × buying_power`, so this value mostly matters for
+    # legacy mode. Set it high enough that the executor's cap is the real
+    # constraint, not this.
+    notional_usd: 1000.0
+    min_depth_contracts: 1.0
+    rearm_distance_bps: 5.0
+    # Take-profit / stop-loss as a fraction of entry mid. 0 disables.
+    # Examples: 0.01 = +1% TP, 0.005 = -0.5% SL.
+    # Remember Delta perps run at high leverage (config above is 100x), so a
+    # 1% mid move = ~100% of the margin posted. Keep these tight.
+    # Disabled here because we use the absolute-USD thresholds below instead;
+    # set these (and zero the USD ones) to revert to percentage-based exits.
+    take_profit_pct: 0.0
+    stop_loss_pct: 0.0
+    # Absolute-USD P&L thresholds. The bot closes a position the instant its
+    # unrealised P&L (signed shares × (close-side price − avg_cost)) crosses
+    # +take_profit_usd (profit) or −stop_loss_usd (loss). Set either to 0 to
+    # disable that side. These take precedence over the % thresholds when
+    # both are configured AND a live portfolio is wired into the strategy
+    # (true on `python -m scripts.run_delta` and the dashboard runner).
+    take_profit_usd: 5.0
+    stop_loss_usd: 3.0
+
+  order_book_sniper:
+    # HFT depth-imbalance scalper. Off by default — flip enabled to true to
+    # run it alongside the mean-reversion scalper. Targets BTC-PERP / ETH-PERP
+    # at high leverage with micro-profit targets (5 bps TP, 3 bps SL).
+    #
+    # Disabled: produced 0 fires over 13k iterations on Delta India during
+    # tuning. Imbalance gate (3.0×) is too strict for current regime;
+    # re-enable and lower imbalance_ratio to 2.0 to wake it up.
+    enabled: true
+    min_edge: 0.0005
+    # Cumulative bid/ask depth must be >= imbalance_ratio×other side
+    # within ±imbalance_band_bps of mid (10 bps = 0.1% band per the spec).
+    imbalance_ratio: 3.0
+    imbalance_band_bps: 10.0
+    imbalance_max_levels: 10
+    # Confirm the tape: require at least N inferred aggressive takers in
+    # the matching direction over the last tape_window_seconds. Inferred
+    # from successive book deltas (no separate trades feed needed).
+    tape_min_count: 3
+    tape_window_seconds: 2.0
+    notional_usd: 1000.0
+    # Tight micro-profit bands per the spec.
+    take_profit_pct: 0.0005    # +0.05% from entry mid
+    stop_loss_pct: 0.0003      # -0.03% from entry mid
+    take_profit_usd: 0.0
+    stop_loss_usd: 0.0
+    max_hold_seconds: 10.0     # force market-exit after 10s
+    # Spoofing defense: if the entry-side wall shrinks > spoof_vanish_ratio
+    # within spoof_persist_seconds of entry and the wall was at least
+    # spoof_min_wall_contracts, market-exit regardless of P&L.
+    # spoof_min_wall_contracts=0 means "check every wall"; set to e.g. 50 to
+    # only protect against BTC-style mega walls.
+    spoof_min_wall_contracts: 0.0
+    spoof_persist_seconds: 1.0
+    spoof_vanish_ratio: 0.5
+    # Limit-order placement: best_bid + N ticks for buys (best_ask − N for
+    # sells). Uses the market's minimum_tick from Delta product metadata.
+    entry_tick_offset: 1
+    rearm_distance_bps: 3.0
+
+  bid_ask_spread_fade:
+    # Market-making lite. Posts simultaneous BUY + SELL limit quotes
+    # inside the spread, captures a fraction of the spread as carry,
+    # holds inventory near flat. THE ONLY strategy in this codebase
+    # that pays Delta's MAKER fee (~2 bps) instead of the taker fee
+    # (~5 bps) — break-even win rate ~55% vs ~62-78% for the takers.
+    #
+    # The strategy stamps ``time_in_force="gtc", post_only=True`` on
+    # every emitted leg so its quotes rest on the book regardless of
+    # the exchange-level default (which stays IOC for the other six
+    # strategies' aggressive entries and closes). See
+    # ``aera/strategies/bid_ask_spread_fade.py::_build_quote_signal``
+    # and ``aera/execution/delta_exchange.py::DeltaLiveExchange.submit``
+    # for the per-leg override path.
+    enabled: true
+    min_edge: 0.0004
+    # Only quote when current spread / mid >= 0.03% (per spec).
+    # Anything tighter cannot clear two maker fees + net-edge target.
+    min_spread_pct: 0.0003
+    # Capture 60% of the spread (the inner 60%, mid ± 30% of spread).
+    capture_target: 0.60
+    # Reference notional emitted per side. To get verbatim $5 quotes
+    # on a small bankroll set risk.trade_size_fraction = 0 (legacy
+    # mode) so the executor doesn't rescale up to the target.
+    quote_size_usd: 5.0
+    # Hard cap on absolute inventory notional (USD). Past this, the
+    # offending side stops quoting.
+    max_inventory_usd: 15.0
+    # Past this, quotes are shifted to bias offloading (skew).
+    inventory_skew_threshold_usd: 10.0
+    inventory_skew_ticks: 1
+    # Re-quote cadence (the engine's scan loop runs faster than this).
+    refresh_rate_ms: 500.0
+    # Volatility kill switch: 0.08% peak-to-trough move inside 5s
+    # suspends quoting until the move drops out of the window.
+    kill_move_pct: 0.0008
+    kill_window_seconds: 5.0
+    # Fee math. Delta's maker fee is 0.02% — net edge after two maker
+    # fees must clear 0.04% before the strategy quotes.
+    maker_fee_bps: 2.0
+    min_net_edge_bps: 4.0
+    # Spec asks for 1x leverage on this strategy. Set to null to
+    # inherit the venue leverage instead.
+    leverage_override: 1.0
+
+  flow_scalp:
+    # Tape Reading Momentum (Flow Scalp). HFT taker-flow scalper.
+    # Detects a single market order ≥ 5× the rolling 100-trade average
+    # size, waits for ≥ 1 same-direction confirmation print (≥ 2× avg)
+    # within 3 seconds, then front-runs the continued flow at the touch.
+    # Tight TP (+0.08%), trailing stop (-0.02% from best), hard SL
+    # (-0.04%), and a hard 60s hold-timeout. Spec: BTC-PERP / liquid
+    # majors during US market hours.
+    enabled: true
+    min_edge: 0.0008
+    # Whale detection: single taker trade size compared to the rolling
+    # avg over the last `avg_window` trades. Spec defaults = 5× / 100.
+    # Tightened 5.0 -> 6.5 and confirm_count 1 -> 2: require a clearer
+    # whale plus *two* same-direction follow-ups before riding the flow.
+    whale_multiple: 6.5
+    confirm_multiple: 2.0
+    confirm_count: 2
+    confirm_window_seconds: 3.0
+    avg_window: 100
+    tape_max_trades: 500
+    notional_usd: 1000.0
+    # Exits per spec: 0.08% TP, 0.04% hard SL, 0.02% trail (activates
+    # once mid prints above entry for longs / below for shorts).
+    take_profit_pct: 0.0008
+    stop_loss_pct: 0.0004
+    trailing_stop_pct: 0.0002
+    take_profit_usd: 0.0
+    stop_loss_usd: 0.0
+    # Whale flow doesn't persist — bail after 60s even if still flat.
+    max_hold_seconds: 60.0
+    rearm_distance_bps: 5.0
+    # Spec asks for 5× leverage. Set to null to inherit the venue's
+    # account leverage (markets.delta.leverage) instead.
+    leverage_override: 5.0
+    # Keep true while running off Delta's REST/WS book feed only.
+    # Flip to false and call FlowScalp.record_trade() externally when
+    # subscribing to a real trades-channel feed.
+    auto_infer_from_book: true
+
+  micro_vwap_sniper:
+    # Micro VWAP Reversion Sniper. Mid-frequency mean-reversion scalper
+    # that fades short-term deviations (>0.12%) from a 1-minute rolling
+    # micro-VWAP when short-window volume drops below 70% of the 5-min
+    # baseline (= exhausted aggressors). Designed for high-liquidity
+    # perps (BTC/ETH/SOL) during quiet intraday periods.
+    #
+    # Disabled: produced 0 fires over 13k iterations. Combination of
+    # 0.12% deviation gate + volume-drop-off + hour-skip is rarely all
+    # satisfied during the wall-clock window we tested. Re-enable
+    # during quiet US session if you want sparse high-quality fades.
+    enabled: true
+    min_edge: 0.0005
+    # 1-minute rolling micro-VWAP per spec.
+    vwap_window_seconds: 60.0
+    # |mid - vwap| / vwap must exceed this fraction to fire. 0.0012 = 0.12%.
+    deviation_pct: 0.0012
+    # Volume drop-off: short-window per-second rate must be < ratio_max
+    # of the long-window per-second baseline. 10s vs 5-min, ratio 0.70
+    # = "current 10s volume < 70% of 5-min average volume" (spec).
+    volume_short_seconds: 10.0
+    volume_long_seconds: 300.0
+    volume_ratio_max: 0.70
+    # Reference notional emitted on each fire. The executor's
+    # trade_size_fraction will typically REPLACE this number.
+    notional_usd: 1000.0
+    # Primary TP = VWAP value at time of entry (a static snapshot —
+    # handled internally). tp_extra_bps stretches the target past
+    # VWAP by N bps in the favourable direction (0 = exit exactly
+    # at the VWAP-at-entry snapshot, matching the spec primary).
+    # take_profit_pct is a safety floor (used only if VWAP snapshot
+    # can't be hit) — keep at 0.0007 (~0.07% per spec stretch target).
+    take_profit_pct: 0.0007
+    tp_extra_bps: 0.0
+    # Hard % stop on entry mid. Spec: 0.0005 (0.05% extended dev).
+    stop_loss_pct: 0.0005
+    take_profit_usd: 0.0
+    stop_loss_usd: 0.0
+    # Hold timeout — spec 15-90s.
+    max_hold_seconds: 90.0
+    # Spread guard: skip when spread / mid exceeds this fraction.
+    # Spec: 0.0005 = 0.05%. 0 disables.
+    max_spread_pct: 0.0005
+    # Skip the first 5 minutes of every wall-clock hour (the rolling
+    # VWAP buffer drains across the hour boundary and produces false
+    # deviations).
+    hour_skip_seconds: 300.0
+    # Spec asks for 5x leverage. null = inherit from venue.
+    leverage_override: 5.0
+    rearm_distance_bps: 3.0
+
+  stop_hunt_reversal:
+    # Stop Hunt / Liquidity Grab Reversal. Detects engineered stop-hunt
+    # wicks — sudden 0.15%+ spikes below a recent swing low (bullish
+    # sweep) or above a recent swing high (bearish sweep) that close
+    # back inside the level on the same 1s candle. Fades the sweep,
+    # riding the snap-back with a partial TP at +0.10% (60% of size),
+    # final TP at +0.20%, and a wick-anchored hard stop at the wick
+    # low − 0.08% (mirror for shorts). Spec: BTC-PERP / ETH-PERP,
+    # low-liquidity windows preferred.
+    #
+    # Disabled: produced 0 fires over 13k iterations. Engineered
+    # 0.15% wicks are rare structural events and Delta India during
+    # the test window had no clean sweep candles. Re-enable for
+    # Asian session or weekend chop where they're more common.
+    enabled: true
+    min_edge: 0.0015
+    # 1-second OHLC bars per spec. Raise to e.g. 5 for noisier
+    # higher-timeframe sweeps (be sure to widen recovery_seconds).
+    bar_seconds: 1.0
+    max_bars: 300
+    # Swing-pivot detection on the trailing minute (60 bars × 1s).
+    # 5-bar fractal (strength=2 each side) matches the canonical
+    # "swing high/low" definition; the latest 3 levels are kept.
+    swing_lookback_bars: 60
+    swing_pivot_strength: 2
+    swing_count: 3
+    # Sweep gates (per spec):
+    #   wick depth ≥ 0.15%, body < 30% of range, recovers < 3s,
+    #   wick volume ≥ 1.5× avg of the prior 30 bars.
+    wick_size_pct: 0.0015
+    body_ratio_max: 0.30
+    recovery_seconds: 3.0
+    volume_multiple: 1.5
+    volume_lookback_bars: 30
+    # Delta confirmation: bearish sweeps want "delta flips red"
+    # (= net selling pressure on the wick close). bullish sweeps
+    # mirror. Flip require_delta_confirmation to false if your
+    # book-inference noise is too high to read clean delta.
+    require_delta_confirmation: true
+    delta_flip_threshold: 0.0001
+    # Exit ladder per spec.
+    take_profit_pct: 0.0020      # TP2 — +0.20%
+    tp1_pct: 0.0010              # TP1 — +0.10%
+    tp1_fraction: 0.60           # close 60% at TP1, 40% remains for TP2
+    stop_extra_pct: 0.0008       # SL = wick_low − 0.08% (mirror for shorts)
+    stop_loss_pct: 0.0           # entry-mid % fallback; 0 disabled
+    take_profit_usd: 0.0
+    stop_loss_usd: 0.0
+    # Stale snap-backs decay into trend trades; flatten at 60s.
+    max_hold_seconds: 60.0
+    # Spec asks for 5× max leverage. null = inherit venue leverage.
+    leverage_override: 5.0
+    notional_usd: 1000.0
+    rearm_distance_bps: 5.0
+
+  tick_reversal_scalp:
+    # HFT tick-exhaustion fade. Off by default. Mid-frequency micro-profit
+    # scalper that fades a 5+ tick directional run when per-tick volume
+    # decays and an S/R level is being tested. Designed for BTC/SOL perps.
+    enabled: true
+    min_edge: 0.0004
+    # A "tick" here is any scan iteration where the mid price changes.
+    # Direction = sign of the mid move; size = liquidity eaten on the
+    # leading side. Spec asks for 5+ consecutive same-direction ticks.
+    # Tightened 5 -> 6: require a longer exhaustion run for higher
+    # mean-reversion probability.
+    min_streak: 6
+    max_buffer_ticks: 200
+    # Per-tick volume must decay by at least this fraction across the
+    # streak (last-tick eaten / first-tick eaten <= 1 - threshold).
+    # Tightened 0.20 -> 0.35: insist on stronger exhaustion of the
+    # initiating side before fading.
+    size_decay_threshold: 0.35
+    # S/R proxy: current mid within sr_band_bps of the local extreme
+    # (low for long, high for short) inside the last sr_lookback_ticks.
+    # 0 disables. 5 bps is conservative for liquid majors.
+    sr_band_bps: 5.0
+    sr_lookback_ticks: 50
+    # Bid depth (for long) / ask depth (for short) must end the streak
+    # larger than it started. Captures "buyers stepping in" on the fade.
+    require_depth_trend: true
+    # Skip filters — set the multiplier / threshold to 0 to disable.
+    # Wide spread = thin venue; skip when spread > N × EMA spread.
+    max_spread_multiple: 3.0
+    spread_ema_alpha: 0.05
+    # Volume spike proxy: short-window rate vs long-window rate.
+    # 5.0 = "skip when last 5s is firing 5× faster than the 60s avg".
+    volume_spike_multiple: 5.0
+    volume_short_window_seconds: 5.0
+    volume_long_window_seconds: 60.0
+    # News-spike proxy: skip if ANY single tick in the last
+    # news_lookback_seconds moved more than news_max_tick_bps. 50 bps in
+    # a single mid-update is a flash-crash signature, not a normal scalp
+    # setup. 0 disables.
+    news_lookback_seconds: 60.0
+    news_max_tick_bps: 50.0
+    notional_usd: 1000.0
+    # Spec: limit at mid. entry_offset_bps biases away from mid (+ve =
+    # more passive; ‑ve = more aggressive). 0 = exactly at mid.
+    entry_offset_bps: 0.0
+    # Tight TP/SL per spec — 4 bps target, 2.5 bps stop.
+    take_profit_pct: 0.0004
+    stop_loss_pct: 0.00025
+    take_profit_usd: 0.0
+    stop_loss_usd: 0.0
+    # Hard hold timeout — stale reversals turn into trend trades.
+    max_hold_seconds: 30.0
+    rearm_distance_bps: 3.0
+
+markets:
+  delta:
+    # 25x = balanced: $100 bankroll × 25x = $2500 buying power → with
+    # compound_fraction=0.20 below this targets ~$500 notional per trade.
+    # A 0.5% adverse move = $2.50 (= ~symmetric with the $1.50 SL below
+    # at 30 bps adverse, well clear of ordinary bid-ask noise).
+    # 100x was deliberately tighter and bled to spread/noise on every fire.
+    leverage: 25
+    # Symbols to subscribe to. Each one is auto-discovered from /v2/products,
+    # so contract_value, max_leverage, and margin% are pulled from Delta;
+    # we just have to name them here. Cheap-contract coins (XRPUSDT, DOGEUSDT)
+    # are excellent paper-trading playgrounds because 1 contract is small
+    # enough to fit a tiny bankroll without overshoot.
+    symbols:
+      - ETHUSD       # 1 contract ≈ $21   (works on $20 bankroll)
+      - XRPUSD       # 1 contract ≈ $1.3  (works on $20 bankroll)
+      - DOGEUSD      # 1 contract ≈ $10   (works on $20 bankroll)
+      - SOLUSD       # 1 contract ≈ $84   (needs overshoot ≥ 45 OR bankroll ≥ $100)
+      - BTCUSD       # 1 contract ≈ $76   (needs overshoot ≥ 40 OR bankroll ≥ $100)
+
+    # With bankroll=$20, leverage=50x, and trade_size_fraction=0.5 the
+    # executor sizes each Delta leg to ~$500 of notional (= 50% of buying
+    # power). At that scale every Delta symbol fits in plenty of contracts,
+    # so contract-overshoot is no longer the dominant constraint:
+    #   ~50 lots of DOGE  ($10/lot)   = $500  (perfect fit)
+    #   ~24 lots of ETH   ($21/lot)   = $504
+    #   ~385 lots of XRP  ($1.3/lot)  = $500
+    # min_trade_notional_usd is the venue's per-order floor (Delta's typical
+    # min is $1 of notional); overshoot only bites for sub-$1-per-contract
+    # symbols which Delta doesn't offer.
+    min_trade_notional_usd: 1.0
+    # Reject a trade if the 1-contract-minimum overshoots the intended
+    # notional by more than this multiple. Keep at 1.5 (50% slack) once
+    # sizing is leverage-aware — the only path to overshoot is now if the
+    # intended notional itself collapses below 1 contract, which would be
+    # a config bug worth surfacing rather than papering over.
+    max_notional_overshoot: 1.5
+
+simulation:
+  monte_carlo_runs: 1000
+  default_edge: 0.0004          # 4 bps average edge per trade
+  default_win_rate: 0.535
+  default_payoff_ratio: 1.0     # symmetric +1 / -1 unit
+
+greedy:
+  # Greedy autopilot — overrides per-trade TP/SL and leverage so the bot
+  # targets the smallest possible profit-locking exit (fees + $1), rides
+  # winners with a trailing ratchet, and stair-steps leverage up on win
+  # streaks. Compounds aggressively by deploying ~90% of the live bankroll
+  # on every fresh entry. Flip enabled to true to take over from the
+  # strategy-side TP/SL settings.
+  enabled: true
+  # Dynamic TP:  target = round_trip_fees × fee_pad_multiple + min_profit_usd
+  #
+  # Sized so the break-even win rate is achievable. Math:
+  #   notional = $2000 (capped by max_notional_usd below)
+  #   round-trip fees @ 5 bps × 2 = $2.00
+  #   TP trigger position-PnL = fees + min_profit = $5.00 (25 bps move)
+  #   SL trigger position-PnL = -initial_sl_usd  = -$3.00 (15 bps move)
+  #   net realised win  = +$3.00  (TP - fees)
+  #   net realised loss = -$5.00  (SL - fees)
+  #   break-even win rate = 5 / (3+5) = 62.5%  ← hard but achievable
+  #
+  # If you want a lower BE win rate, bump min_profit_usd and
+  # initial_sl_usd in the same proportion (the fee floor stays fixed,
+  # so larger realized P&L shrinks fee drag as a share of each trade).
+  # Keeping them close to the fee size guarantees ~80% BE win rate
+  # which no scalper hits sustainably.
+  min_profit_usd: 3.0
+  fee_pad_multiple: 1.0
+  # Extend TP target by this much each time it's crossed so winners
+  # ride past +R instead of capping out. Combined with trailing SL
+  # ratchet (lock_in_trigger_ratio + trailing_giveback_usd) the mean
+  # winning trade pays > min_profit, partially offsetting the fee drag.
+  extend_tp_step_usd: 1.0
+  # Position-PnL trigger for stop-loss (gross of fees). Realised loss
+  # after exit fee = -(initial_sl_usd + round_trip_fees). At $2000
+  # notional with $2 fees: realised loss = -$5.00 = 25 bps adverse.
+  # Wide enough to clear ordinary bid-ask noise but capped by
+  # max_consecutive_losses below so a bad regime auto-halts trading.
+  initial_sl_usd: 3.0
+  lock_in_trigger_ratio: 0.5      # start ratcheting at 50% of TP target
+  trailing_giveback_usd: 1.0      # give back at most $1.00 from the peak
+  max_hold_seconds: 120.0         # hard exit if neither TP/SL fires
+  # Greedy leverage (per fresh entry):
+  # Fixed 25x leverage. min == max so every entry is sized against
+  # bankroll × 25x of buying power; leverage_step=0 disables the win-
+  # streak ramp so leverage stays exactly 25x trade after trade.
+  # respect_venue_cap below clamps this back to the per-symbol max if
+  # the venue refuses 25x for some symbol.
+  min_leverage: 25.0
+  max_leverage: 25.0
+  leverage_step: 0.0
+  respect_venue_cap: true         # cap at market.metadata["leverage"]
+  # Compounding fraction — replaces risk.trade_size_fraction when greedy
+  # is on. With $20 bankroll × 25x × 0.15 = $75 notional per trade.
+  # Tightened 0.20 → 0.15: the brain's auto-mute / probation cycle
+  # needs a few losing trades to detect a bad regime; smaller per-
+  # trade size means those discovery losses don't blow the bankroll.
+  # The brain's probation_size_mult further halves this on returning
+  # strategies, and HIGH_VOL regime applies high_vol_size_mult on top.
+  compound_fraction: 0.15
+  # Hard ceiling on per-trade notional in USD. CRITICAL when bankroll
+  # grows because the absolute-USD TP/SL thresholds above (min_profit_usd,
+  # initial_sl_usd) are calibrated for SMALL notionals: at $500k notional
+  # the round-trip fees alone are $500, so the $1.50 SL is microscopic
+  # noise and every "stop-loss" exit takes a fee-dominated $500 loss.
+  # $2000 cap ⇒ fees per trade = $2, the $1 profit floor and $1.50 SL
+  # remain meaningful percentages of the trade. Set to 0 to disable.
+  max_notional_usd: 2000.0
+  # When > 0, override execution.taker_fee_bps for the TP/fee math only.
+  # Useful if the venue's reported fee differs from the paper config.
+  fee_override_bps: 0.0
+
+brain:
+  # Adaptive Brain — live edge tracker + regime router + circuit-breakers.
+  # The brain sits between the strategies and the executor (after greedy)
+  # and applies vetoes / size shrinks to fresh entries based on:
+  #   1. Per-strategy live performance (mutes losing strategies for
+  #      mute_seconds, returns them on probation at half size).
+  #   2. Per-symbol regime (RANGE / TREND_UP / TREND_DOWN / HIGH_VOL /
+  #      NEWS_SPIKE). Mean-reversion strategies only fire in RANGE,
+  #      flow_scalp only in TREND_*; NEWS_SPIKE vetoes everything.
+  #   3. Daily rolling realised PnL — if it drops below
+  #      daily_loss_pct × bankroll, all entries pause for the rest of
+  #      the 24h window.
+  #   4. Gross long / short exposure cap across all symbols.
+  #
+  # Reduce-only legs (TP/SL closes, greedy flattens) ALWAYS flow
+  # regardless of brain state — the brain only ever shrinks or
+  # vetoes fresh entries. Override per-run with BOT_BRAIN=true|false.
+  enabled: true
+  # ---- per-strategy performance gate ------------------------------
+  # Minimum closed round-trips before the win-rate / expectancy gates
+  # are evaluated. Below this the strategy fires at full size.
+  min_trades_for_eval: 10
+  # Rolling depth of the per-strategy PnL window.
+  perf_window: 30
+  # Mute the strategy if rolling win-rate < min_win_rate OR
+  # rolling expectancy < min_expectancy_usd.
+  min_win_rate: 0.40
+  min_expectancy_usd: 0.0
+  # Hard mute on N consecutive losses regardless of rolling stats.
+  max_strategy_loss_streak: 4
+  # Cooldown when a mute fires.
+  mute_seconds: 600.0
+  # Probation: after the mute window the strategy re-engages at
+  # ``probation_size_mult`` until it completes ``probation_trades``
+  # additional trades with non-negative average PnL — then it
+  # graduates back to 1.0 size.
+  probation_trades: 5
+  probation_size_mult: 0.5
+  # ---- regime detector tunables -----------------------------------
+  # Loosened from the initial defaults — micro-tick drift
+  # consistently classified as TREND_* on real Delta data, which
+  # vetoed every mean-reversion fire on the first day. The current
+  # values (trend_threshold 0.60) treat anything weaker than ~6 bps
+  # signed drift per ATR as RANGE.
+  regime_short_window: 30
+  regime_long_window: 300
+  regime_trend_threshold: 0.60   # |drift / vol| → TREND_* above this
+  regime_high_vol_ratio: 2.5     # short-ATR / long-ATR → HIGH_VOL above
+  regime_news_tick_bps: 35.0     # single-tick move > N bps → NEWS_SPIKE
+  # SOFT regime veto: wrong-regime entries fire at reduced size
+  # instead of being dropped. The perf gate then auto-mutes the
+  # strategy if the wrong-regime fires actually lose money — letting
+  # empirical evidence decide rather than a prior. Flip to false to
+  # restore hard-veto behaviour. NEWS_SPIKE is ALWAYS hard-vetoed.
+  regime_soft_veto: true
+  wrong_regime_size_mult: 0.5
+  high_vol_size_mult: 0.5        # shrink size by half in HIGH_VOL regime
+  # ---- circuit-breakers -------------------------------------------
+  # Pause entries when 24h rolling realised PnL ≤ -daily_loss_pct ×
+  # bankroll. 0.10 = "halt entries for the rest of the day after
+  # losing 10% of the running peak bankroll".
+  daily_loss_pct: 0.10
+  daily_window_seconds: 86400.0
+  # Per-side gross-notional cap = max_gross_exposure_mult × bankroll
+  # × leverage. With default 2.0 and a $100 bankroll on 25× perps,
+  # the cap is $100 × 25 × 2.0 = $5,000 of notional — ≈ 13 concurrent
+  # $375 scalps before the brain says "enough". WAS 2.0 × settled
+  # wealth (= $200 on a $100 bankroll), which blocked every $375
+  # scalp on its first attempt — the bug visible in the first
+  # session's "corr_veto" counter. Now scales with leverage so
+  # leveraged perps actually clear the gate. 0 disables.
+  max_gross_exposure_mult: 2.0

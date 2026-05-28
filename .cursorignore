@@ -1,0 +1,80 @@
+# Cursor IDE indexing exclusions.
+#
+# Mirrors .gitignore for secrets / venv / caches AND additionally hides
+# large generated assets the AI never needs to see (compiled JS bundles,
+# dataset dumps) so retrieval stays focused on real source code.
+#
+# Syntax: same as .gitignore. Patterns starting with `!` re-include.
+
+# --------------------------------------------------------------------
+# Secrets - NEVER feed credentials into model context
+# --------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+secrets.json
+
+# --------------------------------------------------------------------
+# Python build / cache / venv
+# --------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Lint / test / type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --------------------------------------------------------------------
+# Runtime data / logs
+# --------------------------------------------------------------------
+data/
+logs/
+*.log
+*.parquet
+*.csv
+*.feather
+*.arrow
+*.pkl
+*.pickle
+*.sqlite
+*.sqlite3
+*.db
+
+# --------------------------------------------------------------------
+# OS / editor noise
+# --------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+.history/
+
+# --------------------------------------------------------------------
+# Cursor's own working folders (transcripts, terminal dumps, MCP cache)
+# --------------------------------------------------------------------
+agent-transcripts/
+terminals/
+mcps/
+.cursorindex/
+.cursor-server/
