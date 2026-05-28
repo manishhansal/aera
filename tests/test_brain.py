@@ -69,6 +69,11 @@ def _cfg(**overrides) -> BrainConfig:
         min_expectancy_usd=0.0,
         max_strategy_loss_streak=3,
         mute_seconds=600.0,
+        # Disabled by default in test cfgs so the existing test
+        # suite (which fires the same strategy on the same symbol
+        # multiple times in a row) keeps passing. The dedicated
+        # post-loss-cool-down test re-enables it.
+        post_loss_cooldown_seconds=0.0,
         probation_trades=3,
         probation_size_mult=0.5,
         regime_short_window=10,
@@ -708,3 +713,117 @@ def test_brain_news_spike_vetoes_even_flow_scalp():
     out = brain.filter_signals([sig], {"BTCUSD": market})
     assert out == []
     assert brain.stats.signals_vetoed_regime == 1
+
+
+# ---------------------------------------------------------------------------
+# post-loss cool-down (per strategy × symbol)
+# ---------------------------------------------------------------------------
+
+
+def test_post_loss_cooldown_blocks_same_strategy_on_same_symbol():
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            post_loss_cooldown_seconds=60.0,
+            max_strategy_loss_streak=99,  # don't auto-mute, isolate the cool-down
+            min_trades_for_eval=99,
+        ),
+        pf, clock=clock,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    brain.on_trade_closed("flow_scalp", -1.0, symbol="BTCUSD")
+
+    sig = _make_signal("flow_scalp", market_id="BTCUSD")
+    out = brain.filter_signals([sig], {"BTCUSD": btc})
+    assert out == [], "same (strategy, symbol) within cool-down → blocked"
+    assert brain.stats.signals_vetoed_post_loss == 1
+    assert "post-loss" in sig.metadata.get("brain_veto_reason", "").lower()
+
+
+def test_post_loss_cooldown_does_not_block_other_symbol():
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            post_loss_cooldown_seconds=60.0,
+            max_strategy_loss_streak=99,
+            min_trades_for_eval=99,
+        ),
+        pf, clock=clock,
+    )
+    btc = _make_market("BTCUSD")
+    eth = _make_market("ETHUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc, "ETHUSD": eth})
+
+    brain.on_trade_closed("flow_scalp", -1.0, symbol="BTCUSD")
+
+    sig = _make_signal("flow_scalp", market_id="ETHUSD")
+    out = brain.filter_signals([sig], {"BTCUSD": btc, "ETHUSD": eth})
+    assert len(out) == 1, "different symbol should not be blocked"
+
+
+def test_post_loss_cooldown_expires():
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock(t=1000.0)
+    brain = AdaptiveBrain(
+        _cfg(
+            post_loss_cooldown_seconds=60.0,
+            max_strategy_loss_streak=99,
+            min_trades_for_eval=99,
+        ),
+        pf, clock=clock,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    brain.on_trade_closed("flow_scalp", -1.0, symbol="BTCUSD")
+    clock.tick(61.0)
+
+    sig = _make_signal("flow_scalp", market_id="BTCUSD")
+    out = brain.filter_signals([sig], {"BTCUSD": btc})
+    assert len(out) == 1, "cool-down should expire after the configured window"
+
+
+def test_winning_close_does_not_arm_cooldown():
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(post_loss_cooldown_seconds=60.0),
+        pf, clock=clock,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    brain.on_trade_closed("flow_scalp", +1.0, symbol="BTCUSD")
+
+    sig = _make_signal("flow_scalp", market_id="BTCUSD")
+    out = brain.filter_signals([sig], {"BTCUSD": btc})
+    assert len(out) == 1
+    assert brain.stats.signals_vetoed_post_loss == 0
+
+
+def test_daily_loss_veto_tags_signal_with_reason():
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock(t=1000.0)
+    brain = AdaptiveBrain(
+        _cfg(daily_loss_pct=0.05),  # cap = -$5 on $100 bankroll
+        pf, clock=clock,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    brain.on_trade_closed("flow_scalp", -10.0)  # blows past the cap
+
+    sig = _make_signal("flow_scalp", market_id="BTCUSD")
+    out = brain.filter_signals([sig], {"BTCUSD": btc})
+    assert out == []
+    reason = sig.metadata.get("brain_veto_reason", "")
+    assert "daily loss" in reason.lower(), reason

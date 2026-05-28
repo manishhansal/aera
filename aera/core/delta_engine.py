@@ -365,7 +365,13 @@ class DeltaEngine:
                         delta = float(pos.realised_pnl) - pre
                         if abs(delta) < 1e-9:
                             continue
-                        self.brain.on_trade_closed(sig.strategy, delta)
+                        # ``key`` is "<market_id>:<outcome_id>" — the
+                        # market_id is the symbol the brain keys its
+                        # post-loss cool-down by.
+                        symbol = key.split(":", 1)[0] if ":" in key else None
+                        self.brain.on_trade_closed(
+                            sig.strategy, delta, symbol=symbol,
+                        )
                 except Exception as exc:
                     log.exception("brain on_execution/on_trade_closed crashed: %s", exc)
             await self._emit(self._on_execution, result)
@@ -546,6 +552,7 @@ class DeltaEngine:
                 f"mute_veto={bs.signals_vetoed_mute} "
                 f"daily_veto={bs.signals_vetoed_daily_loss} "
                 f"corr_veto={bs.signals_vetoed_correlation} "
+                f"postloss_veto={bs.signals_vetoed_post_loss} "
                 f"shrunk={bs.signals_shrunk} muted_now={muted} "
                 f"daily_pnl=${bs.daily_pnl:+.2f}"
             )

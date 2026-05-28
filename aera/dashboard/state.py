@@ -644,6 +644,7 @@ class DashboardState:
             "signals_vetoed_mute": int(bs.signals_vetoed_mute),
             "signals_vetoed_daily_loss": int(bs.signals_vetoed_daily_loss),
             "signals_vetoed_correlation": int(bs.signals_vetoed_correlation),
+            "signals_vetoed_post_loss": int(bs.signals_vetoed_post_loss),
             "signals_shrunk": int(bs.signals_shrunk),
             "daily_pnl": float(bs.daily_pnl),
             "daily_pnl_floor": float(bs.daily_pnl_floor),

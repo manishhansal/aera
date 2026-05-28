@@ -184,6 +184,7 @@ class BrainStats:
     signals_vetoed_mute: int = 0
     signals_vetoed_daily_loss: int = 0
     signals_vetoed_correlation: int = 0
+    signals_vetoed_post_loss: int = 0
     signals_shrunk: int = 0
     daily_pnl: float = 0.0
     daily_pnl_floor: float = 0.0  # the trip level (computed dynamically)
@@ -238,6 +239,13 @@ class AdaptiveBrain:
             news_tick_bps=float(getattr(cfg, "regime_news_tick_bps", 25.0)),
         )
         self._perf: Dict[str, _StratPerf] = {}
+        # Per (strategy, symbol) cool-down after a losing close. Stops
+        # revenge-trading the same setup that just lost — by the time
+        # the cool-down expires the market conditions usually look
+        # different and the next entry is no longer a re-fire on the
+        # same losing pattern. Keyed by ("strategy", "symbol") → unix
+        # timestamp when the cool-down ends.
+        self._post_loss_cooldown: Dict[Tuple[str, str], float] = {}
         # Rolling 24h PnL: (timestamp, pnl) pairs, evicted on observe.
         self._daily_pnls: Deque[Tuple[float, float]] = deque()
         self._daily_window_seconds = float(
@@ -315,9 +323,18 @@ class AdaptiveBrain:
 
         # Daily-loss circuit breaker
         if self._daily_loss_tripped():
-            # Still allow reduce-only legs through so positions can close.
-            out = [s for s in signals if any(getattr(l, "reduce_only", False) for l in s.legs)]
-            vetoed = len(signals) - len(out)
+            reason = (
+                f"daily loss cap: pnl=${self.stats.daily_pnl:+.2f} ≤ "
+                f"floor=${self.stats.daily_pnl_floor:.2f}"
+            )
+            out: List[Signal] = []
+            vetoed = 0
+            for s in signals:
+                if any(getattr(l, "reduce_only", False) for l in s.legs):
+                    out.append(s)
+                else:
+                    self._tag_vetoed(s, reason)
+                    vetoed += 1
             self.stats.signals_vetoed_daily_loss += vetoed
             if vetoed:
                 log.warning(
@@ -350,7 +367,24 @@ class AdaptiveBrain:
             perf = self.perf(sig.strategy)
             if perf.muted_until and now < perf.muted_until:
                 self.stats.signals_vetoed_mute += 1
-                self._tag_vetoed(sig, "brain mute")
+                left = max(0.0, perf.muted_until - now)
+                self._tag_vetoed(sig, f"brain mute ({left:.0f}s left)")
+                continue
+
+            # Post-loss cool-down: if THIS strategy just closed a loss
+            # on THIS symbol, sit out until the cooldown expires.
+            # Stops the bot from immediately re-entering the same
+            # losing pattern on the same market. Symbol-scoped so a
+            # losing scalp on BTCUSD doesn't block a fresh fire on
+            # SOLUSD by the same strategy.
+            cooldown_left = self._post_loss_cooldown_left(sig, now)
+            if cooldown_left > 0:
+                self.stats.signals_vetoed_post_loss += 1
+                self._tag_vetoed(
+                    sig,
+                    f"post-loss cool-down on {sig.metadata.get('symbol', '?')} "
+                    f"({cooldown_left:.0f}s left)",
+                )
                 continue
 
             # Regime veto (per leg's market). One bad market = drop the
@@ -417,6 +451,28 @@ class AdaptiveBrain:
 
         return kept
 
+    def _post_loss_cooldown_left(self, sig: Signal, now: float) -> float:
+        """Return the seconds remaining on the (strategy, symbol)
+        post-loss cool-down, or 0 if not in cool-down. Checks every
+        leg's market so a multi-leg signal is held back if ANY leg's
+        market is in cool-down (multi-leg signals are rare so this is
+        practically per-symbol).
+        """
+        if not self._post_loss_cooldown:
+            return 0.0
+        max_left = 0.0
+        for leg in sig.legs:
+            unlock = self._post_loss_cooldown.get((sig.strategy, leg.market_id), 0.0)
+            left = unlock - now
+            if left > max_left:
+                max_left = left
+        # Lazy-clear expired entries to keep the dict small.
+        if max_left <= 0.0:
+            expired = [k for k, t in self._post_loss_cooldown.items() if t <= now]
+            for k in expired:
+                del self._post_loss_cooldown[k]
+        return max(0.0, max_left)
+
     @staticmethod
     def _tag_vetoed(sig: Signal, reason: str) -> None:
         """Stamp the brain's veto reason on a signal so the dashboard
@@ -450,13 +506,25 @@ class AdaptiveBrain:
         )
 
     def on_trade_closed(
-        self, strategy: str, pnl_usd: float, *, now: Optional[float] = None
+        self,
+        strategy: str,
+        pnl_usd: float,
+        *,
+        symbol: Optional[str] = None,
+        now: Optional[float] = None,
     ) -> None:
         """Absorb a round-trip's realised PnL into the trackers.
 
         Called by the engine when a round-trip closes (the dashboard's
         round-trip tracker is the most reliable source; the engine
         forwards ``TradeEvent.pnl`` here).
+
+        ``symbol`` is optional for back-compat with older callers /
+        tests, but supplying it enables the per-(strategy, symbol)
+        post-loss cool-down — on a losing close the brain refuses
+        new entries from this strategy on this symbol for
+        ``post_loss_cooldown_seconds`` so we don't immediately
+        re-fire into the same losing pattern.
         """
         if not self.enabled:
             return
@@ -474,6 +542,10 @@ class AdaptiveBrain:
         elif pnl_usd < 0:
             perf.consecutive_losses += 1
             perf.consecutive_wins = 0
+            # Arm the post-loss cool-down for (strategy, symbol).
+            cool = float(getattr(self.cfg, "post_loss_cooldown_seconds", 0.0))
+            if cool > 0 and symbol:
+                self._post_loss_cooldown[(strategy, symbol)] = now + cool
 
         # Daily PnL bookkeeping
         self._daily_pnls.append((now, float(pnl_usd)))

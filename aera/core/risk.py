@@ -16,8 +16,9 @@ drawdown — quarter-Kelly halves growth but cuts drawdown variance by 4x.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from aera.logging import get_logger
 from aera.settings import RiskConfig
@@ -84,26 +85,115 @@ class RiskDecision:
 
 
 class RiskManager:
-    """Gatekeeper that vets every trade against bankroll/exposure/drawdown."""
+    """Gatekeeper that vets every trade against bankroll/exposure/drawdown.
 
-    def __init__(self, config: RiskConfig, portfolio: Portfolio) -> None:
+    Halt semantics (was: a single sticky ``_halted = True`` that froze
+    the bot forever once tripped — kept the user stuck with
+    "manually halted" rejections after 6 losses, no recovery):
+
+    * **Manual halt** (``manual_halt()`` / ``resume()``) — still
+      sticky. Reserved for explicit operator action.
+    * **Drawdown halt** — sticky until ``resume()``. Catastrophic;
+      requires human review.
+    * **Loss-streak halt** — TIME-LIMITED cool-down (default 5 min).
+      Six losses in a row on a scalping bot is normal noise, not a
+      reason to kill the bot forever. The bot pauses for
+      ``loss_streak_cooldown_seconds``, then auto-resumes IFF the
+      portfolio's ``consecutive_losses`` has not climbed further in
+      the meantime (the next close resets it on any win).
+
+    The reason string surfaced to the dashboard now distinguishes
+    "manually halted" / "drawdown halt" / "cool-down (N losses,
+    Ns left)" so the user can see WHY they're stuck.
+    """
+
+    def __init__(
+        self,
+        config: RiskConfig,
+        portfolio: Portfolio,
+        *,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
         self.config = config
         self.portfolio = portfolio
-        self._halted = False
+        self._clock = clock or time.time
+        # Sticky manual / drawdown halts.
+        self._manual_halt = False
+        self._drawdown_halt = False
+        # Time-limited cool-down (loss-streak).
+        self._cooldown_until: float = 0.0
+        self._cooldown_reason: str = ""
+        # Snapshot of the loss streak that triggered the cool-down.
+        # Lets us detect "still bleeding" vs "we cooled off and a new
+        # streak began" so we don't keep extending forever.
+        self._cooldown_streak_anchor: int = 0
 
     @property
     def halted(self) -> bool:
-        return self._halted
+        return self._manual_halt or self._drawdown_halt or self._in_cooldown()
+
+    def _in_cooldown(self) -> bool:
+        return self._clock() < self._cooldown_until
+
+    def manual_halt(self) -> None:
+        """Operator action: stop everything until ``resume`` is called."""
+        self._manual_halt = True
+
+    def resume(self) -> None:
+        """Clear ALL halt states so the bot can trade again."""
+        self._manual_halt = False
+        self._drawdown_halt = False
+        self._cooldown_until = 0.0
+        self._cooldown_reason = ""
+        self._cooldown_streak_anchor = 0
+        # Best-effort: don't let stale streak state keep re-tripping
+        # the cool-down on the very next vet() call.
+        self.portfolio.consecutive_losses = 0
 
     def check_halts(self) -> RiskDecision:
-        if self._halted:
+        # Sticky halts win first.
+        if self._manual_halt:
             return RiskDecision(False, "manually halted")
+        if self._drawdown_halt:
+            return RiskDecision(
+                False,
+                f"drawdown halt ({self.portfolio.drawdown():.1%} ≥ {self.config.max_drawdown:.0%})",
+            )
+
+        # Drawdown trip (sticky from here on).
         if self.portfolio.drawdown() >= self.config.max_drawdown:
-            self._halted = True
-            return RiskDecision(False, f"drawdown limit {self.config.max_drawdown:.0%} hit")
-        if self.portfolio.consecutive_losses >= self.config.max_consecutive_losses:
-            self._halted = True
-            return RiskDecision(False, f"{self.portfolio.consecutive_losses} consecutive losses")
+            self._drawdown_halt = True
+            return RiskDecision(
+                False,
+                f"drawdown limit {self.config.max_drawdown:.0%} hit",
+            )
+
+        # Loss-streak → time-limited cool-down (NOT sticky).
+        streak = int(self.portfolio.consecutive_losses)
+        cap = int(self.config.max_consecutive_losses)
+        cooldown_s = float(getattr(self.config, "loss_streak_cooldown_seconds", 300.0))
+        now = float(self._clock())
+
+        if cap > 0 and streak >= cap and not self._in_cooldown():
+            # Open a fresh cool-down only when the streak has actually
+            # advanced past the previous anchor — protects against the
+            # case where the bot ended cool-down, took ONE more loss,
+            # and instantly retripped.
+            if streak > self._cooldown_streak_anchor:
+                self._cooldown_until = now + cooldown_s
+                self._cooldown_streak_anchor = streak
+                self._cooldown_reason = (
+                    f"loss streak cool-down ({streak} losses → pause {cooldown_s:.0f}s)"
+                )
+                log.warning("risk: %s", self._cooldown_reason)
+
+        if self._in_cooldown():
+            remaining = max(0.0, self._cooldown_until - now)
+            return RiskDecision(
+                False,
+                f"loss-streak cool-down ({streak} losses, {remaining:.0f}s left)",
+            )
+
         return RiskDecision(True)
 
     def vet(

@@ -52,7 +52,20 @@ class RiskConfig(BaseModel):
     # at startup when this invariant is violated.
     max_market_exposure: float = 0.50
     max_drawdown: float = 0.50
-    max_consecutive_losses: int = 8
+    # Number of consecutive LOSING closed trades that triggers the
+    # loss-streak cool-down. This is NOT a permanent halt — the bot
+    # pauses for ``loss_streak_cooldown_seconds`` and then resumes
+    # automatically. Set 0 to disable the cool-down entirely. For
+    # scalping bots taking dozens of trades per hour, six losses in
+    # a row is normal noise; the default of 15 lets the brain's
+    # per-strategy mute do the precise work and only fires the
+    # bot-wide cool-down on real bleeding.
+    max_consecutive_losses: int = 15
+    # How long the loss-streak halt pauses the bot before letting
+    # new entries through again. Defaults to 5 min — long enough to
+    # let the market move past whatever noise tagged us, short
+    # enough that the bot recovers within a session.
+    loss_streak_cooldown_seconds: float = 300.0
 
 
 class ExecutionConfig(BaseModel):
@@ -597,10 +610,21 @@ class BrainConfig(BaseModel):
     min_expectancy_usd: float = 0.0
     # Hard stop on consecutive losses per strategy. Trips an
     # immediate mute even before the rolling stats are evaluated.
-    max_strategy_loss_streak: int = 4
+    # Lower = kill bleeders faster. 2 means a strategy that loses
+    # two trades in a row is paused for ``mute_seconds``; the
+    # post-loss cool-down (``post_loss_cooldown_seconds``) already
+    # prevents same-symbol revenge trades, so this only fires when
+    # the same strategy loses on TWO DIFFERENT symbols in a row.
+    max_strategy_loss_streak: int = 2
     # Mute duration after a gate trips (seconds). After expiry the
     # strategy re-engages on probation.
     mute_seconds: float = 600.0
+    # Per-(strategy, symbol) cool-down after a losing close. Refuses
+    # new entries on the same (strategy, symbol) pair for this many
+    # seconds. Stops the bot from re-entering the same losing pattern
+    # right after a stop-out (the primary cause of "lost six in a
+    # row in 6 minutes" runs in early sessions). 0 disables.
+    post_loss_cooldown_seconds: float = 60.0
     # Probation: number of closed trades the strategy must complete
     # at ``probation_size_mult`` size before graduating back to 1.0.
     # Graduation requires non-negative expectancy across the window.

@@ -47,14 +47,19 @@ risk:
   # session; this is the hard kill that protects against a series of
   # sessions all going wrong.
   max_drawdown: 0.25
-  # Hard stop on consecutive losses across ALL strategies combined.
-  # Was 100 (effectively never). 6 is honest: at ~$5 realised loss per
-  # losing trade against a $20 bankroll that's $30 drawn from peak (≈
-  # 30% of an unleveraged base; less on the compounded buying power).
-  # The brain auto-mutes individual losing strategies at 4 in a row
-  # via ``max_strategy_loss_streak`` so this only trips on a
-  # cross-strategy meltdown.
-  max_consecutive_losses: 6
+  # Number of consecutive LOSING closed trades that triggers the
+  # loss-streak cool-down. This is NO LONGER a permanent halt — the
+  # bot pauses for ``loss_streak_cooldown_seconds`` and then resumes
+  # automatically. Was 6 (way too tight for a scalping bot doing
+  # dozens of trades/hour — burned a single noisy session with no
+  # recovery). 15 is high enough that the brain's per-strategy mute
+  # (max_strategy_loss_streak=3) does the precise work, and only a
+  # cross-strategy meltdown triggers the bot-wide pause.
+  max_consecutive_losses: 15
+  # Cool-down duration when ``max_consecutive_losses`` trips. Long
+  # enough for the market to move past whatever noise tagged us,
+  # short enough that the bot recovers within the same session.
+  loss_streak_cooldown_seconds: 300.0
 
 execution:
   # Taker fee applied to every paper-exchange fill (and reported by live
@@ -481,13 +486,16 @@ greedy:
   leverage_step: 0.0
   respect_venue_cap: true         # cap at market.metadata["leverage"]
   # Compounding fraction — replaces risk.trade_size_fraction when greedy
-  # is on. With $20 bankroll × 25x × 0.15 = $75 notional per trade.
-  # Tightened 0.20 → 0.15: the brain's auto-mute / probation cycle
-  # needs a few losing trades to detect a bad regime; smaller per-
-  # trade size means those discovery losses don't blow the bankroll.
-  # The brain's probation_size_mult further halves this on returning
-  # strategies, and HIGH_VOL regime applies high_vol_size_mult on top.
-  compound_fraction: 0.15
+  # is on. With $100 bankroll × 25x × 0.05 = $125 notional per trade.
+  # Tightened 0.15 → 0.05: the previous setting bled the bankroll on
+  # the brain's exploration phase (the first dozen trades while it
+  # learns which strategies have edge). 5% buying power per trade
+  # means we can afford to take 10+ losing exploration trades before
+  # any single mute / drawdown limit fires. Once the brain's
+  # win-streak ramp kicks in, ``compound_growth_mult`` lifts the
+  # size on confirmed winners (the asymmetry "small when uncertain,
+  # bigger when winning" is the whole point of the autopilot).
+  compound_fraction: 0.05
   # Hard ceiling on per-trade notional in USD. CRITICAL when bankroll
   # grows because the absolute-USD TP/SL thresholds above (min_profit_usd,
   # initial_sl_usd) are calibrated for SMALL notionals: at $500k notional
@@ -529,9 +537,23 @@ brain:
   min_win_rate: 0.40
   min_expectancy_usd: 0.0
   # Hard mute on N consecutive losses regardless of rolling stats.
-  max_strategy_loss_streak: 4
+  # Was 4 — too patient: a strategy could bleed 3 losses in a row
+  # and keep firing at full size. 2 means after losing TWO trades
+  # back-to-back the strategy is paused for ``mute_seconds``. The
+  # post-loss cool-down (below) already stops same-symbol revenge
+  # trades, so this only fires when the same strategy loses on two
+  # DIFFERENT symbols in a row — a strong signal the edge is gone.
+  max_strategy_loss_streak: 2
   # Cooldown when a mute fires.
   mute_seconds: 600.0
+  # Per-(strategy, symbol) cool-down after a losing close. The brain
+  # refuses new entries on the same pair for this many seconds. This
+  # is the single biggest fix for "lost six in a row in six minutes"
+  # — the bot was instantly re-entering the same losing pattern on
+  # the same market. 60s is short enough that real reversion signals
+  # still fire on the next setup, but long enough that the immediate
+  # noise that stopped us out has moved on. 0 disables.
+  post_loss_cooldown_seconds: 60.0
   # Probation: after the mute window the strategy re-engages at
   # ``probation_size_mult`` until it completes ``probation_trades``
   # additional trades with non-negative average PnL — then it
