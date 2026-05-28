@@ -4,6 +4,10 @@
 > The README is the user-facing manual; this file is the navigation
 > chart for *editing* the codebase. Read it once before making changes.
 
+**Repository:** <https://github.com/manishhansal/aera>
+**Default branch:** `master`
+**Issues / PRs:** <https://github.com/manishhansal/aera/issues>
+
 ---
 
 ## 1. What this project is

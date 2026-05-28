@@ -1,5 +1,11 @@
 # aera
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-314%20passing-brightgreen.svg)](#testing)
+[![License](https://img.shields.io/badge/license-personal--use-lightgrey.svg)](#disclaimers)
+
+**Repository:** <https://github.com/manishhansal/aera>
+
 > **An autonomous Delta Exchange perpetual-futures trading bot.**
 > Mean-reversion + order-flow + sweep + market-making scalping on
 > USD-quoted perps, with an **adaptive brain** that measures each
@@ -65,7 +71,7 @@
 ## TL;DR
 
 ```bash
-git clone <this repo> aera && cd aera
+git clone https://github.com/manishhansal/aera.git && cd aera
 python -m venv .venv && source .venv/Scripts/activate     # Windows git-bash
 pip install -r requirements.txt
 
@@ -1139,7 +1145,7 @@ so you can paper-trade end-to-end without thinking about ratios.
 ## Installation
 
 ```bash
-git clone <this repo> aera && cd aera
+git clone https://github.com/manishhansal/aera.git && cd aera
 python -m venv .venv
 # Windows (git-bash): source .venv/Scripts/activate
 # macOS / Linux:      source .venv/bin/activate
@@ -1293,6 +1299,21 @@ hold-timeout exits, rearm debounce), the Greedy autopilot
 ramp, compounding fraction, per-market cap bypass for fresh entries),
 the dashboard state container + FastAPI routes, Kelly + compounding
 math, and the order book primitives.
+
+---
+
+## Contributing / issues
+
+Bug reports, questions, and PRs are welcome on GitHub:
+
+* Issues: <https://github.com/manishhansal/aera/issues>
+* Pull requests: <https://github.com/manishhansal/aera/pulls>
+
+Before opening a PR, please run the test suite locally
+(`python -m pytest -q`, 314 tests should pass) and read
+[`CONTEXT.md`](./CONTEXT.md) — it documents the signal-to-fill
+pipeline, the risk-cap invariants, and the conventions every new
+strategy must follow.
 
 ---
 
