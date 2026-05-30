@@ -88,6 +88,10 @@ STRATEGY_REGIME_PREFS: Dict[str, Set[Regime]] = {
     "micro_vwap_sniper": {Regime.RANGE, Regime.UNKNOWN},
     "stop_hunt_reversal": {Regime.RANGE, Regime.UNKNOWN},
     "flow_scalp": {Regime.TREND_UP, Regime.TREND_DOWN, Regime.UNKNOWN},
+    # MoneyPrinter is regime-agnostic — it carries its own ML gate
+    # that already conditions on the same features the regime
+    # detector uses, plus an hour-of-day gate learned from backtest.
+    "money_printer": {Regime.RANGE, Regime.TREND_UP, Regime.TREND_DOWN, Regime.UNKNOWN},
 }
 
 
@@ -121,6 +125,11 @@ class _StratPerf:
     # of new closed trades. Then graduates back to 1.0.
     probation: bool = False
     probation_trades_left: int = 0
+    # Permanent kill: lifetime PnL fell below the configured floor
+    # (``BrainConfig.lifetime_pnl_kill_floor_usd``). Once set, no
+    # entry signal from this strategy fires until the bot is
+    # restarted with a fresh config — no probation, no auto-revive.
+    killed: bool = False
 
     @property
     def n(self) -> int:
@@ -171,6 +180,7 @@ class _StratPerf:
             "size_mult": float(self.size_mult),
             "probation": self.probation,
             "probation_trades_left": self.probation_trades_left,
+            "killed": self.killed,
         }
 
 
@@ -185,6 +195,7 @@ class BrainStats:
     signals_vetoed_daily_loss: int = 0
     signals_vetoed_correlation: int = 0
     signals_vetoed_post_loss: int = 0
+    signals_vetoed_cost: int = 0     # edge didn't clear taker-fee + slippage
     signals_shrunk: int = 0
     daily_pnl: float = 0.0
     daily_pnl_floor: float = 0.0  # the trip level (computed dynamically)
@@ -227,10 +238,18 @@ class AdaptiveBrain:
         *,
         clock=None,
         regime_book: Optional[RegimeBook] = None,
+        taker_fee_bps: float = 0.0,
     ) -> None:
         self.cfg = cfg
         self.portfolio = portfolio
         self._clock = clock or time.time
+        # Execution cost the brain uses when vetoing low-edge signals.
+        # Sourced from ``execution.taker_fee_bps`` at construction time
+        # (one side); the round-trip / slippage adjustments live in
+        # ``BrainConfig.cost_*``. We snapshot it here rather than reach
+        # into ``self.cfg`` because BrainConfig is a "pure" config object
+        # that doesn't know about the wider execution settings.
+        self._taker_fee_bps = max(0.0, float(taker_fee_bps))
         self.regimes: RegimeBook = regime_book or RegimeBook(
             short_window=int(getattr(cfg, "regime_short_window", 30)),
             long_window=int(getattr(cfg, "regime_long_window", 300)),
@@ -365,6 +384,20 @@ class AdaptiveBrain:
 
             # Strategy mute
             perf = self.perf(sig.strategy)
+            # Permanent kill (lifetime PnL kill switch). Reached when
+            # the strategy's total realised PnL drops below the
+            # configured floor — at that point we've collected enough
+            # evidence that the strategy is structurally broken on
+            # this venue / regime, and no probation-cycle revival
+            # will fix it. Stays killed until the bot restarts.
+            if perf.killed:
+                self.stats.signals_vetoed_mute += 1
+                self._tag_vetoed(
+                    sig,
+                    f"strategy killed (lifetime PnL ${perf.total_pnl:+.2f} ≤ "
+                    f"floor ${float(getattr(self.cfg, 'lifetime_pnl_kill_floor_usd', 0.0)):.2f})",
+                )
+                continue
             if perf.muted_until and now < perf.muted_until:
                 self.stats.signals_vetoed_mute += 1
                 left = max(0.0, perf.muted_until - now)
@@ -386,6 +419,32 @@ class AdaptiveBrain:
                     f"({cooldown_left:.0f}s left)",
                 )
                 continue
+
+            # Cost-aware edge gate. The strategy's ``edge`` is its
+            # expected per-trade return as a decimal (e.g. 0.002 ⇒
+            # 20 bps). If after subtracting taker-fee round-trip plus
+            # an assumed slippage floor the signal doesn't clear
+            # ``min_edge_after_costs_bps``, we drop it. This kills the
+            # most common "guaranteed loss" pattern: a strategy whose
+            # ``min_edge`` floor (e.g. 4 bps) is below the venue's
+            # round-trip taker fee (10 bps), so every low-end fire is
+            # negative-EV before slippage even hits.
+            cost_floor = float(getattr(self.cfg, "min_edge_after_costs_bps", 0.0))
+            if cost_floor > 0:
+                rt_legs = max(1, int(getattr(self.cfg, "cost_round_trip_legs", 2)))
+                slip_bps = float(getattr(self.cfg, "cost_assumed_slippage_bps", 0.0))
+                rt_fee_bps = self._taker_fee_bps * rt_legs
+                edge_bps = float(sig.edge) * 1e4
+                net_edge_bps = edge_bps - rt_fee_bps - slip_bps
+                if net_edge_bps < cost_floor:
+                    self.stats.signals_vetoed_cost += 1
+                    self._tag_vetoed(
+                        sig,
+                        f"edge {edge_bps:.1f}bps - fees {rt_fee_bps:.1f}bps - "
+                        f"slip {slip_bps:.1f}bps = {net_edge_bps:.1f}bps < "
+                        f"floor {cost_floor:.1f}bps",
+                    )
+                    continue
 
             # Regime veto (per leg's market). One bad market = drop the
             # whole signal. NEWS_SPIKE is always a hard veto; wrong-
@@ -562,6 +621,27 @@ class AdaptiveBrain:
                     "(expectancy=$%+.4f over %d trades)",
                     strategy, perf.expectancy, perf.n,
                 )
+
+        # Lifetime PnL kill switch — once tripped, the strategy is
+        # permanently muted until the bot restarts. Checked AFTER the
+        # PnL accumulator updates so the trade that took the strategy
+        # below the floor counts; checked BEFORE the rolling-window
+        # mute logic so the kill takes priority over probation cycling.
+        kill_floor = float(
+            getattr(self.cfg, "lifetime_pnl_kill_floor_usd", 0.0)
+        )
+        if (
+            kill_floor < 0
+            and not perf.killed
+            and perf.total_pnl <= kill_floor
+        ):
+            perf.killed = True
+            perf.muted_until = now + 1e12  # belt-and-braces visual mute
+            log.warning(
+                "brain KILL %s: lifetime PnL $%+.4f ≤ floor $%.2f — "
+                "strategy permanently muted (restart bot to re-arm)",
+                strategy, perf.total_pnl, kill_floor,
+            )
 
         # Performance gate
         self._maybe_mute(perf, now)

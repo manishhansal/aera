@@ -532,7 +532,10 @@
         $("exp-gross").textContent = "gross " + fmtUsd(an.gross_exposure ?? 0, 2);
         const netEl = $("exp-net");
         const ne = an.net_exposure ?? 0;
-        netEl.textContent = "net " + fmtSignedUsd(ne, 2);
+        // The badge on the open-positions card is *exposure* (signed
+        // notional), not PnL. Labelling it "net" alone reads as PnL on a
+        // green/red badge next to live positions; spell it out.
+        netEl.textContent = "exposure " + fmtSignedUsd(ne, 2);
         netEl.classList.toggle("num-pos", ne > 0);
         netEl.classList.toggle("num-neg", ne < 0);
     }
@@ -763,22 +766,57 @@
     function renderPositions(positions) {
         const body = $("positions-body");
         $("positions-count").textContent = positions.length;
+        const upnlBadge = $("positions-upnl");
         if (!positions.length) {
-            body.innerHTML = '<tr class="empty"><td colspan="6">flat — no open positions</td></tr>';
+            body.innerHTML = '<tr class="empty"><td colspan="7">flat — no open positions</td></tr>';
+            if (upnlBadge) {
+                upnlBadge.textContent = "uPnL $0.00";
+                upnlBadge.classList.remove("num-pos", "num-neg");
+            }
             return;
         }
+        // Pick a shares-column precision that scales with the typical
+        // share count for the asset. ``toFixed(2)`` showed "0.00" for
+        // 0.003 BTC because BTC sized to a few-hundred-dollar notional
+        // is always sub-1-share. Rule: <0.01 → 6dp, <1 → 4dp, <100 →
+        // 3dp, else 2dp. Same axis used for avg-cost ("price") so a
+        // four-digit XRP price (1.2966) keeps four decimals while a
+        // 73k BTC price doesn't need any.
+        const fmtShares = (x) => {
+            const a = Math.abs(x);
+            if (a >= 100) return x.toFixed(2);
+            if (a >= 1)   return x.toFixed(3);
+            if (a >= 0.01) return x.toFixed(4);
+            return x.toFixed(6);
+        };
+        const fmtPrice = (x) => {
+            const a = Math.abs(x);
+            if (a >= 1000) return x.toFixed(2);
+            if (a >= 1)    return x.toFixed(4);
+            return x.toFixed(6);
+        };
+        let netUpnl = 0;
         body.innerHTML = positions.map((p) => {
             const side = p.shares >= 0 ? "LONG" : "SHORT";
             const sideCls = side === "LONG" ? "long" : "short";
+            const upnl = Number(p.unrealised_pnl ?? 0);
+            netUpnl += upnl;
+            const mark = Number(p.mark ?? p.avg_cost);
             return `<tr>
                 <td title="${p.market_id}">${shortId(p.market_id)}</td>
                 <td><span class="tag ${sideCls}">${side}</span></td>
-                <td class="${p.shares >= 0 ? "num-pos" : "num-neg"}">${Number(p.shares).toFixed(2)}</td>
-                <td>$${Number(p.avg_cost).toFixed(4)}</td>
-                <td class="${p.realised_pnl >= 0 ? "num-pos" : "num-neg"}">${fmtSignedUsd(p.realised_pnl, 4)}</td>
+                <td class="${p.shares >= 0 ? "num-pos" : "num-neg"}">${fmtShares(Number(p.shares))}</td>
+                <td>$${fmtPrice(Number(p.avg_cost))}</td>
+                <td>$${fmtPrice(mark)}</td>
+                <td class="${upnl >= 0 ? "num-pos" : "num-neg"}">${fmtSignedUsd(upnl, 4)}</td>
                 <td>${fmtUsd(p.notional, 2)}</td>
             </tr>`;
         }).join("");
+        if (upnlBadge) {
+            upnlBadge.textContent = "uPnL " + fmtSignedUsd(netUpnl, 2);
+            upnlBadge.classList.toggle("num-pos", netUpnl >= 0);
+            upnlBadge.classList.toggle("num-neg", netUpnl < 0);
+        }
     }
 
     function renderStrategies(strats, strategy_pnl) {

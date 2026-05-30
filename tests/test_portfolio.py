@@ -138,6 +138,131 @@ def test_unleveraged_path_is_bit_for_bit_identical_to_before():
     assert math.isclose(p.position("m", "Y").realised_pnl, 1.5)
 
 
+def test_leverage_mismatch_does_not_corrupt_locked_margin():
+    """Regression for the live dashboard reporting ``locked_margin=-$78``
+    after a long paper run.
+
+    Root cause: per-fill leverage was authoritative for both the
+    margin posted (open) and the margin returned (close). When an open
+    used one leverage (e.g. greedy's chosen 25x) and the close used a
+    slightly different leverage (e.g. a strategy that fell back to 1x
+    on a path with no metadata), the incremental ``locked_margin``
+    update drifted — across hundreds of fills it ended up wildly
+    negative, which silently inflated ``bankroll`` and caused new
+    trades to be sized too large.
+
+    Fix: ``locked_margin`` is recomputed from open positions every
+    fill. The lone open position dictates the floor; bankroll absorbs
+    the leverage delta as part of settled_wealth.
+    """
+    p = Portfolio(bankroll=1000.0)
+    p.apply_fill(Fill(
+        timestamp=0, market_id="BTCUSD", outcome_id="BTCUSD",
+        side="BUY", price=100.0, size=10.0, leverage=25.0,
+    ))
+    open_margin = 10.0 * 100.0 / 25.0
+    assert math.isclose(p.locked_margin, open_margin)
+    assert math.isclose(p.bankroll, 1000.0 - open_margin)
+    p.apply_fill(Fill(
+        timestamp=1, market_id="BTCUSD", outcome_id="BTCUSD",
+        side="SELL", price=100.0, size=10.0, leverage=1.0, fee=0.0,
+    ))
+    assert p.locked_margin >= 0.0, (
+        f"locked_margin went negative ({p.locked_margin}); pre-fix the "
+        f"close at lev=1 would have returned 10x the original margin to "
+        f"bankroll and left locked_margin at -$960."
+    )
+    assert math.isclose(p.locked_margin, 0.0, abs_tol=1e-9)
+    assert math.isclose(p.settled_wealth, 1000.0, abs_tol=1e-6)
+
+
+def test_scale_in_then_full_close_zeroes_locked_margin():
+    """Two opens at different prices, single close: locked_margin must
+    return cleanly to zero regardless of the average-cost weighting."""
+    p = Portfolio(bankroll=1000.0)
+    p.apply_fill(Fill(0, "BTCUSD", "BTCUSD", "BUY", 100.0, 3.0, leverage=10.0))
+    p.apply_fill(Fill(1, "BTCUSD", "BTCUSD", "BUY", 110.0, 2.0, leverage=10.0))
+    assert math.isclose(p.position("BTCUSD", "BTCUSD").shares, 5.0)
+    assert math.isclose(p.position("BTCUSD", "BTCUSD").avg_cost, 104.0)
+    p.apply_fill(Fill(2, "BTCUSD", "BTCUSD", "SELL", 108.0, 5.0, leverage=10.0))
+    assert math.isclose(p.locked_margin, 0.0, abs_tol=1e-9)
+    # realized = (108 - 104) * 5 = 20
+    assert math.isclose(p.position("BTCUSD", "BTCUSD").realised_pnl, 20.0, abs_tol=1e-6)
+    assert math.isclose(p.bankroll, 1020.0, abs_tol=1e-6)
+
+
+def test_dust_residual_is_swept_on_reducing_fill():
+    """Regression for ghost positions accumulating on the dashboard.
+
+    Live evidence: after running for ~30 min the bot showed 5 "open"
+    positions with shares=-0.00 (rounded) and notionals of $0.01 yet
+    realised PnL of -$0.18 to -$0.74 attached to each. Those were the
+    residuals of partial closes that the venue refused to flatten
+    further (sub-min-contract size) so they accumulated forever,
+    silently locking margin and surfacing as dust ghosts.
+
+    Fix: a partial close that leaves the residual below
+    ``dust_threshold_usd`` triggers an automatic sweep — book
+    ``(mark - avg_cost) × shares`` as realised PnL and zero out the
+    position. The next ``apply_fill`` re-derives ``locked_margin``
+    from open positions so the swept margin returns to bankroll.
+    """
+    p = Portfolio(bankroll=1000.0, dust_threshold_usd=1.0)
+    # Open a $200 BTC short.
+    p.apply_fill(Fill(0, "BTCUSD", "BTCUSD", "SELL", 100.0, 2.0, leverage=25.0))
+    assert math.isclose(p.position("BTCUSD", "BTCUSD").shares, -2.0)
+    # Close 1.995 (= $199.5) — residual $0.5 notional, below the $1 dust floor.
+    p.apply_fill(Fill(1, "BTCUSD", "BTCUSD", "BUY", 100.5, 1.995, leverage=25.0))
+    pos = p.position("BTCUSD", "BTCUSD")
+    assert pos.shares == 0.0, (
+        f"dust residual should be swept to zero, got {pos.shares}"
+    )
+    assert math.isclose(p.locked_margin, 0.0, abs_tol=1e-9), (
+        "locked margin must return to zero after dust sweep"
+    )
+    # The sweep booked (mark - avg_cost) × shares = (100.5 - 100) × -0.005
+    # = -$0.0025 of mark-to-market loss on the residual, on top of the
+    # main close's -$1.0 of loss (100 - 100.5) × 1.995 + tiny fee = -$0.998.
+    # Total realised ≈ -$1.0 (the main close dominates; dust is a rounding
+    # adjustment).
+    assert pos.realised_pnl < 0, "loss-side close should book negative PnL"
+
+
+def test_dust_sweep_disabled_when_threshold_zero():
+    """``dust_threshold_usd=0`` preserves the legacy behaviour where dust
+    residuals sit on the book forever. Useful when running live on a
+    venue that supports arbitrary-size closes (no min contract size)."""
+    p = Portfolio(bankroll=1000.0, dust_threshold_usd=0.0)
+    p.apply_fill(Fill(0, "BTCUSD", "BTCUSD", "SELL", 100.0, 2.0, leverage=25.0))
+    p.apply_fill(Fill(1, "BTCUSD", "BTCUSD", "BUY", 100.5, 1.995, leverage=25.0))
+    pos = p.position("BTCUSD", "BTCUSD")
+    # Residual 0.005 contracts at $100.5 = $0.5025 notional — kept on book.
+    assert math.isclose(abs(pos.shares), 0.005, abs_tol=1e-9)
+    assert math.isclose(abs(pos.shares) * pos.avg_cost, 0.5, abs_tol=1e-3)
+
+
+def test_sweep_dust_bulk_clears_pre_existing_dust():
+    """``Portfolio.sweep_dust`` cleans up dust that pre-existed the
+    per-fill sweep (e.g. bot restart with stale residuals)."""
+    p = Portfolio(bankroll=1000.0, dust_threshold_usd=0.0)
+    # Open then partial-close to leave $0.5 of dust (dust sweep disabled).
+    p.apply_fill(Fill(0, "BTCUSD", "BTCUSD", "SELL", 100.0, 2.0, leverage=25.0))
+    p.apply_fill(Fill(1, "BTCUSD", "BTCUSD", "BUY", 100.0, 1.995, leverage=25.0))
+    pos = p.position("BTCUSD", "BTCUSD")
+    assert abs(pos.shares) > 0  # dust is on the book
+
+    # Now flip on the dust threshold and sweep with a stale mid.
+    p.dust_threshold_usd = 1.0
+    swept = p.sweep_dust({"BTCUSD": 102.0})  # +2 % adverse-for-short mid
+    assert swept == ["BTCUSD"]
+    pos = p.position("BTCUSD", "BTCUSD")
+    assert pos.shares == 0.0
+    # Sweep booked (102 - 100) × -0.005 = -$0.01 of mark-to-market loss on
+    # the residual. Total realised includes the main close's PnL + dust.
+    assert pos.realised_pnl <= 0.0
+    assert math.isclose(p.locked_margin, 0.0, abs_tol=1e-9)
+
+
 def test_leveraged_short_then_buy_to_close():
     """Close a short with a BUY: must return short margin and realize PnL."""
     p = Portfolio(bankroll=500.0)

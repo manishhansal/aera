@@ -206,7 +206,10 @@ async def main() -> None:
         f"bankroll=${bankroll} · http://{args.host}:{args.port}",
     )
 
-    portfolio = Portfolio(bankroll=bankroll)
+    portfolio = Portfolio(
+        bankroll=bankroll,
+        dust_threshold_usd=float(settings.execution.min_order_size_usd),
+    )
     state = DashboardState(portfolio)
     state.paper_mode = not args.live
 
@@ -292,7 +295,10 @@ async def _run_delta(args, settings, portfolio, risk, state, server_task, consol
                 f"lev=[{settings.greedy.min_leverage:g}..{settings.greedy.max_leverage:g}]x "
                 f"compound={settings.greedy.compound_fraction:.0%}"
             )
-        brain = AdaptiveBrain(settings.brain, portfolio)
+        brain = AdaptiveBrain(
+            settings.brain, portfolio,
+            taker_fee_bps=float(settings.execution.taker_fee_bps),
+        )
         if brain.enabled:
             console.print(
                 f"[bold cyan]adaptive brain ON[/] "

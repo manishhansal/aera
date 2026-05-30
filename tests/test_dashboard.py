@@ -280,6 +280,70 @@ def test_fees_subtract_from_round_trip_pnl():
     assert t.pnl == pytest.approx(10.0 - 0.62)
 
 
+def test_open_positions_surface_mark_and_unrealised_pnl():
+    """Regression for the dashboard showing "REALISED $0.0000" on every
+    open position (always true and therefore useless) and no unrealised
+    PnL view at all.
+
+    ``open_positions`` now exposes the latest cached mark per market
+    plus an ``unrealised_pnl`` field. Mark is sourced from the live
+    Market objects on every ``record_markets`` tick; until the first
+    tick lands we fall back to ``avg_cost`` so uPnL reads zero rather
+    than NaN.
+    """
+    from aera.markets import Market, Outcome
+    from aera.markets.orderbook import OrderBook
+
+    pf = Portfolio(bankroll=1000.0)
+    state = DashboardState(pf)
+    pf.apply_fill(Fill(timestamp=0, market_id="ETHUSD", outcome_id="ETHUSD",
+                       side="BUY", price=2000.0, size=0.1, leverage=25.0))
+
+    # No mark cached yet → uPnL must be zero, mark equals avg_cost.
+    rows = state.open_positions()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["mark"] == pytest.approx(2000.0)
+    assert row["unrealised_pnl"] == pytest.approx(0.0)
+    assert row["notional"] == pytest.approx(200.0)
+
+    # Tick in a fresh mid — 2% favourable move = +$4 on 0.1 ETH.
+    book = OrderBook()
+    book.update_level("bid", 2039.0, 5.0)
+    book.update_level("ask", 2041.0, 5.0)
+    eth = Market(
+        id="ETHUSD", slug="eth", question="ETH perp", category="perp",
+        outcomes={"ETHUSD": Outcome(
+            id="ETHUSD", label="ETHUSD",
+            book=book, last_price=2040.0, volume_24h=0.0,
+        )},
+        metadata={},
+    )
+    state.record_markets({eth.id: eth})
+
+    rows = state.open_positions()
+    row = rows[0]
+    assert row["mark"] == pytest.approx(2040.0)
+    assert row["unrealised_pnl"] == pytest.approx(4.0, abs=1e-9)
+    # Notional now reflects the new mark, not the entry price.
+    assert row["notional"] == pytest.approx(204.0, abs=1e-9)
+
+
+def test_open_positions_handles_high_priced_sub_share_positions():
+    """A 0.003 BTC position used to display "0.00 SHARES" because the
+    serialiser dropped precision. Now we surface the full float and let
+    the front-end format it — verify the value isn't being lost on the
+    Python side."""
+    pf = Portfolio(bankroll=1000.0)
+    state = DashboardState(pf)
+    pf.apply_fill(Fill(timestamp=0, market_id="BTCUSD", outcome_id="BTCUSD",
+                       side="BUY", price=72_963.0, size=0.003, leverage=25.0))
+    rows = state.open_positions()
+    assert len(rows) == 1
+    assert rows[0]["shares"] == pytest.approx(0.003)
+    assert rows[0]["notional"] == pytest.approx(0.003 * 72_963.0, rel=1e-6)
+
+
 def test_recent_trades_and_snapshot_expose_round_trips():
     pf = Portfolio(bankroll=1000.0)
     state = DashboardState(pf)

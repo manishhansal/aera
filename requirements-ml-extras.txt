@@ -1,0 +1,9 @@
+# Optional deep-learning extras for the sequence model in
+# `aera.ml.sequence`. Install only if you want to use the transformer
+# encoder as one of the MoneyPrinter scorers:
+#
+#     pip install -r requirements-ml-extras.txt
+#
+# Everything else (per-symbol ensemble, RL agent, GBT classifier)
+# works without torch.
+torch>=2.0.0

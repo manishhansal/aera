@@ -411,6 +411,43 @@ class StopHuntReversalConfig(StrategyConfig):
     rearm_distance_bps: float = 5.0           # debounce between fires
 
 
+class MoneyPrinterConfig(StrategyConfig):
+    """Tunables for the backtest-trained adaptive money-printer.
+
+    The "intelligence" lives in two on-disk artefacts:
+
+    * ``hour_map_path`` — JSON file written by
+      ``scripts/sweep_backtest.py``. Lists which UTC hours have
+      historically been profitable for this strategy on each symbol.
+    * ``model_path`` — joblib pickle of the
+      :class:`~aera.ml.model.ProfitabilityClassifier` written by
+      ``scripts/train_money_printer.py``. Predicts ``P(win)`` on
+      the live feature row.
+
+    With both artefacts present the strategy is strictly more
+    selective than the other scalpers. With only the hour map the
+    ML gate is bypassed but the time gate still applies. With
+    neither present the strategy still trades, using simple
+    mean-reversion + ATR-based exits — but you should treat it as
+    untrained until you've run the pipeline.
+    """
+
+    enabled: bool = False                    # off by default until trained
+    min_edge: float = 0.0
+    bar_seconds: int = 60
+    feature_window_bars: int = 200
+    win_threshold: float = 0.55
+    hour_map_path: str = "data/money_printer/hour_maps.json"
+    model_path: str = "data/money_printer/model.joblib"
+    min_atr_pct: float = 0.0005             # 5 bps / bar — anything quieter is mostly fees
+    max_atr_pct: float = 0.03               # 3% / bar — anything wilder is news
+    tp_atr_mult: float = 1.5
+    sl_atr_mult: float = 1.0
+    max_hold_seconds: float = 1800.0
+    notional_usd: float = 100.0
+    leverage_hint: float = 25.0
+
+
 class StrategiesConfig(BaseModel):
     delta_perp_scalper: DeltaPerpScalperConfig = DeltaPerpScalperConfig()
     order_book_sniper: OrderBookSniperConfig = OrderBookSniperConfig()
@@ -419,6 +456,7 @@ class StrategiesConfig(BaseModel):
     flow_scalp: FlowScalpConfig = FlowScalpConfig()
     micro_vwap_sniper: MicroVWAPSniperConfig = MicroVWAPSniperConfig()
     stop_hunt_reversal: StopHuntReversalConfig = StopHuntReversalConfig()
+    money_printer: MoneyPrinterConfig = MoneyPrinterConfig()
 
 
 class DeltaConfig(BaseModel):
@@ -529,6 +567,37 @@ class GreedyConfig(BaseModel):
     # ---- dynamic SL -----------------------------------------------
     # Initial cushion before the trailing ratchet kicks in (USD).
     initial_sl_usd: float = 1.5
+    # ---- bps-of-notional TP / SL (preferred) ----------------------
+    # When > 0, these OVERRIDE the absolute-USD min_profit_usd /
+    # initial_sl_usd / extend_tp_step_usd triggers with a basis-point
+    # fraction of the actual entry notional. Bps mode auto-scales the
+    # exit thresholds with whatever the compounding sizer actually
+    # opened, so a $5 SL on a $2000 notional and a $0.31 SL on a $125
+    # notional are the SAME 15 bps adverse-price-move trigger.
+    #
+    # Absolute-USD mode breaks when the live trade notional shrinks
+    # well below the size the thresholds were calibrated for: the
+    # required price move to hit a $5 TP at $125 notional is +4%
+    # (vs +25 bps at $2000) — unreachable inside the 120 s hold
+    # window, so every trade exits on timeout with random P&L drift
+    # plus a slight loss bias from spread + slippage. That's the
+    # "6 % win rate, profit factor 0.01" failure mode the bot was in.
+    #
+    # Math (using a 5 bps taker fee + 2 bps slippage, RT = 14 bps):
+    #   TP = 40 bps gross   → net win  = +26 bps after costs
+    #   SL = 20 bps gross   → net loss = -34 bps after costs
+    #   break-even WR ≈ 57 % (achievable for a tuned mean-reversion).
+    #
+    # Set both to 0 to fall back to the legacy absolute-USD mode.
+    tp_bps: float = 40.0
+    sl_bps: float = 20.0
+    # Extend the TP target by this many bps each time profit crosses
+    # it (greedy continuation). Ignored when ``tp_bps == 0``.
+    extend_tp_step_bps: float = 10.0
+    # Once ratcheting in bps mode, give back at most this many bps of
+    # peak-to-current PnL before the SL trips. Ignored when
+    # ``sl_bps == 0`` (USD-mode fallback uses ``trailing_giveback_usd``).
+    trailing_giveback_bps: float = 8.0
     # Begin ratcheting the SL up once PnL_usd >= ratio × tp_target.
     # 0.5 = "start locking in profit at half-way to the TP target".
     lock_in_trigger_ratio: float = 0.5
@@ -661,6 +730,55 @@ class BrainConfig(BaseModel):
     # ≈ 13 concurrent $375 scalps before the brain says "enough".
     # 0 disables — back to the per-market exposure cap in RiskConfig.
     max_gross_exposure_mult: float = 2.0
+    # ---- lifetime PnL kill switch ---------------------------------
+    # If set to a negative dollar value, any strategy whose lifetime
+    # cumulative PnL drops below this floor is HARD-muted — it stays
+    # off until manually re-enabled (no probation cycle, no
+    # auto-revival). Different from the rolling-window mute which
+    # times out after ``mute_seconds`` and the strategy gets another
+    # shot. This is the "this strategy is structurally broken on
+    # this regime/venue, stop trying" gate.
+    #
+    # Example: -5.0 means "after $5 of cumulative losses on this
+    # strategy, never let it fire again until config reload". Set
+    # to 0 to disable. Default is a generous -$10 so the gate only
+    # trips for genuinely broken strategies, not noise.
+    lifetime_pnl_kill_floor_usd: float = -10.0
+
+    # ---- cost-aware edge floor ------------------------------------
+    # Every signal carries an ``edge`` (the strategy's expected per-
+    # trade return as a decimal, e.g. 0.002 = 20 bps). The brain
+    # vetoes any fresh entry whose edge minus the estimated round-
+    # trip taker fee minus assumed slippage doesn't clear this
+    # safety buffer. Set to 0 to disable the gate (return to legacy
+    # behaviour where strategies' own ``min_edge`` is the only
+    # floor — historically that allowed 4 bps strategies to fire on
+    # a 10 bps fee venue, with predictable outcomes).
+    #
+    # Example: taker_fee_bps=5 → round-trip = 10 bps. With
+    # ``min_edge_after_costs_bps=5`` a signal needs edge ≥ 15 bps
+    # gross to pass. At 2 bps fallback slippage the live threshold
+    # is 17 bps — comfortably above the noise floor on a liquid
+    # perp scalp.
+    #
+    # Reduce-only legs (closes) bypass this gate entirely; they
+    # have no notion of edge and must always be allowed to flow.
+    min_edge_after_costs_bps: float = 5.0
+    # Number of taker fees to charge per round-trip when estimating
+    # cost. Entries that close via a separate fill pay BOTH a maker/
+    # taker fee on entry AND on exit — so the default is 2 (taker
+    # both ways). bid_ask_spread_fade-style maker fills will
+    # overstate cost here; raise ``min_edge_after_costs_bps`` to
+    # negative values to relax in those cases (don't think anyone
+    # actually needs to).
+    cost_round_trip_legs: int = 2
+    # Assumed slippage cost layered on top of the fee estimate. The
+    # paper exchange's ``LinearSlippageModel`` uses real book VWAP
+    # when available; this number is the conservative *floor* the
+    # brain assumes when deciding whether an edge clears costs.
+    # Keep aligned with ``execution.default_slippage_bps`` so the
+    # gate matches what fills actually pay.
+    cost_assumed_slippage_bps: float = 2.0
 
 
 class Settings(BaseModel):

@@ -85,6 +85,19 @@ def _cfg(**overrides) -> BrainConfig:
         daily_loss_pct=0.10,
         daily_window_seconds=86400.0,
         max_gross_exposure_mult=2.0,
+        # Cost-aware edge gate disabled by default for the existing
+        # suite — most fixtures use a 50 bps edge with 0 fees so the
+        # default 5 bps floor is a no-op anyway, but explicitly
+        # disabling keeps regression tests honest. The dedicated
+        # cost-gate tests below re-enable it.
+        min_edge_after_costs_bps=0.0,
+        cost_round_trip_legs=2,
+        cost_assumed_slippage_bps=0.0,
+        # Lifetime kill switch disabled in default fixture cfg —
+        # existing tests feed many losing trades to test other gates
+        # and shouldn't trip the lifetime kill. Dedicated tests
+        # re-enable it.
+        lifetime_pnl_kill_floor_usd=0.0,
     )
     base.update(overrides)
     return BrainConfig(**base)
@@ -827,3 +840,196 @@ def test_daily_loss_veto_tags_signal_with_reason():
     assert out == []
     reason = sig.metadata.get("brain_veto_reason", "")
     assert "daily loss" in reason.lower(), reason
+
+
+# ---------------------------------------------------------------------------
+# Cost-aware edge gate
+# ---------------------------------------------------------------------------
+
+
+def test_cost_aware_edge_gate_vetoes_below_fee_floor():
+    """Regression for the "81 % loss rate" failure mode.
+
+    Four of the seven strategies shipped with ``min_edge`` below the
+    venue's 10 bps round-trip taker fee, so every fire at the strategy's
+    low-edge tail was a guaranteed loss before slippage even hit. The
+    brain now enforces a global floor independent of strategy
+    configuration: edge minus round-trip fees minus assumed slippage
+    must clear ``min_edge_after_costs_bps``.
+
+    Concrete numbers: taker_fee_bps=5 (Delta), RT legs=2 → 10 bps RT fee.
+    Slippage assumed 2 bps. With ``min_edge_after_costs_bps=5`` the
+    required gross edge is 17 bps. A 10 bps signal must be vetoed; a
+    20 bps signal must pass.
+    """
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            min_edge_after_costs_bps=5.0,
+            cost_round_trip_legs=2,
+            cost_assumed_slippage_bps=2.0,
+            min_trades_for_eval=999,  # disable mute logic
+        ),
+        pf, clock=clock, taker_fee_bps=5.0,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    # 10 bps edge — fails (10 - 10 - 2 = -2 < 5).
+    sig_low = _make_signal("flow_scalp", market_id="BTCUSD")
+    sig_low.edge = 0.0010
+    # 20 bps edge — passes (20 - 10 - 2 = 8 ≥ 5).
+    sig_high = _make_signal("delta_perp_scalper", market_id="BTCUSD")
+    sig_high.edge = 0.0020
+
+    out = brain.filter_signals([sig_low, sig_high], {"BTCUSD": btc})
+    out_strategies = [s.strategy for s in out]
+    assert "delta_perp_scalper" in out_strategies, (
+        "high-edge signal must pass the cost gate"
+    )
+    assert "flow_scalp" not in out_strategies, (
+        "low-edge signal must be vetoed by the cost gate"
+    )
+    veto_reason = sig_low.metadata.get("brain_veto_reason", "")
+    assert "edge" in veto_reason.lower() and "fee" in veto_reason.lower(), veto_reason
+    assert brain.stats.signals_vetoed_cost == 1
+
+
+def test_cost_aware_edge_gate_disabled_by_zero_floor():
+    """Setting ``min_edge_after_costs_bps=0`` reverts to legacy behaviour
+    where any non-zero edge passes the cost gate."""
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            min_edge_after_costs_bps=0.0,
+            min_trades_for_eval=999,
+        ),
+        pf, clock=clock, taker_fee_bps=5.0,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    sig = _make_signal("flow_scalp", market_id="BTCUSD")
+    sig.edge = 0.0001  # 1 bp — would be vetoed under any positive floor
+    out = brain.filter_signals([sig], {"BTCUSD": btc})
+    assert len(out) == 1
+    assert brain.stats.signals_vetoed_cost == 0
+
+
+def test_lifetime_pnl_kill_switch_permanently_mutes_bleeder():
+    """Regression for the mute → probation → mute → probation cycle.
+
+    Without the kill switch, a structurally broken strategy can keep
+    cycling through the rolling-window mute forever: each round of
+    probation lets it bleed more, the size_mult shrink doesn't stop
+    losses (it just shrinks them), and after ``mute_seconds`` the
+    cycle restarts. The lifetime PnL kill switch ends the loop —
+    once cumulative bleed exceeds the floor, the strategy is
+    permanently muted for the rest of the process.
+    """
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            lifetime_pnl_kill_floor_usd=-3.0,
+            max_strategy_loss_streak=999,  # disable rolling mute
+            min_trades_for_eval=999,
+            min_edge_after_costs_bps=0.0,
+        ),
+        pf, clock=clock,
+    )
+    name = "delta_perp_scalper"
+    # Three losing trades of -$1 each → cumulative -$3 ≤ floor -$3.
+    for _ in range(3):
+        brain.on_trade_closed(name, -1.0)
+    perf = brain.perf(name)
+    assert perf.killed is True, (
+        f"strategy should be killed after lifetime PnL "
+        f"${perf.total_pnl:.2f} ≤ floor -$3.00"
+    )
+
+    # Even AFTER waiting longer than any mute window, a signal stays
+    # vetoed because killed=True. (Verifies the kill is not just a
+    # huge mute_until that auto-expires.)
+    clock.t += 10_000_000.0
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+    sig = _make_signal(name, market_id="BTCUSD")
+    out = brain.filter_signals([sig], {"BTCUSD": btc})
+    assert out == []
+    reason = sig.metadata.get("brain_veto_reason", "")
+    assert "killed" in reason.lower(), reason
+
+
+def test_lifetime_kill_does_not_fire_on_winning_strategy():
+    """A strategy that's net-positive (or just slightly negative but
+    above the floor) must NOT be killed. Kill switch only fires when
+    cumulative PnL drops at or below the configured floor."""
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            lifetime_pnl_kill_floor_usd=-3.0,
+            max_strategy_loss_streak=999,
+            min_trades_for_eval=999,
+            min_edge_after_costs_bps=0.0,
+        ),
+        pf, clock=clock,
+    )
+    name = "tick_reversal_scalp"
+    # Two losses then a big win → cumulative still positive.
+    brain.on_trade_closed(name, -1.0)
+    brain.on_trade_closed(name, -1.0)
+    brain.on_trade_closed(name, +5.0)
+    assert brain.perf(name).killed is False
+    assert brain.perf(name).total_pnl == pytest.approx(3.0)
+
+
+def test_lifetime_kill_disabled_when_floor_is_zero():
+    """``lifetime_pnl_kill_floor_usd=0`` (or any non-negative value)
+    disables the kill switch entirely. Useful for backtests where
+    you want to measure raw strategy expectancy without the gate."""
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            lifetime_pnl_kill_floor_usd=0.0,
+            max_strategy_loss_streak=999,
+            min_trades_for_eval=999,
+            min_edge_after_costs_bps=0.0,
+        ),
+        pf, clock=clock,
+    )
+    name = "delta_perp_scalper"
+    for _ in range(20):
+        brain.on_trade_closed(name, -1.0)
+    assert brain.perf(name).killed is False
+    assert brain.perf(name).total_pnl == pytest.approx(-20.0)
+
+
+def test_cost_aware_edge_gate_lets_reduce_only_closes_through():
+    """Closing legs have no notion of edge and must always flow,
+    regardless of the cost floor or any signal-level edge value."""
+    pf = Portfolio(bankroll=100.0)
+    clock = _FixedClock()
+    brain = AdaptiveBrain(
+        _cfg(
+            min_edge_after_costs_bps=100.0,  # extreme floor
+            min_trades_for_eval=999,
+        ),
+        pf, clock=clock, taker_fee_bps=5.0,
+    )
+    btc = _make_market("BTCUSD")
+    for _ in range(10):
+        brain.regimes.observe_markets({"BTCUSD": btc})
+
+    close = _make_signal("greedy", market_id="BTCUSD", reduce_only=True)
+    close.edge = 0.0  # closes don't carry edge
+    out = brain.filter_signals([close], {"BTCUSD": btc})
+    assert len(out) == 1
+    assert brain.stats.signals_vetoed_cost == 0

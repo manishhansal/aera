@@ -253,6 +253,29 @@ class DeltaEngine:
         market_list = list(self._markets.values())
         all_signals: List[Signal] = []
 
+        # Dust sweep — flatten any sub-min-notional residuals that
+        # accumulated from partial closes. The per-fill sweep in
+        # ``Portfolio.apply_fill`` catches the normal case, but residuals
+        # that were created BEFORE the sweep landed (e.g. on a fresh bot
+        # restart with stale positions, or fp-drift positions that fall
+        # below threshold without a new reducing fill) need a periodic
+        # cleanup. Runs every step but is a no-op when no positions
+        # are dust, so the cost is one dict lookup per open position.
+        if self.executor.portfolio.dust_threshold_usd > 0:
+            try:
+                mids: Dict[str, float] = {}
+                for m in self._markets.values():
+                    for o in m.outcomes.values():
+                        if o.mid and o.mid > 0:
+                            mids[m.id] = float(o.mid)
+                            break
+                swept = self.executor.portfolio.sweep_dust(mids)
+                if swept:
+                    log.info("engine: dust sweep cleared %d position(s): %s",
+                             len(swept), ", ".join(swept[:5]))
+            except Exception as exc:
+                log.exception("engine: dust sweep crashed: %s", exc)
+
         # Brain regime observation — must run before any signal
         # filtering so the per-symbol detectors are warm for this tick.
         if self.brain is not None and self.brain.enabled:

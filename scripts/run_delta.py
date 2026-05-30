@@ -57,6 +57,7 @@ from aera.strategies import (
     DeltaPerpetualScalper,
     FlowScalp,
     MicroVWAPSniper,
+    MoneyPrinter,
     OrderBookSniper,
     StopHuntReversal,
     TickReversalScalp,
@@ -70,7 +71,19 @@ from aera.strategies import (
 ALL_STRATEGIES_SENTINEL = "all"
 
 
-def build_strategies(names: List[str], portfolio: Portfolio) -> list:
+def _strategy_factories(portfolio: Portfolio) -> dict:
+    """Return ``{strategy_name: factory}`` wired against the current
+    ``config.yaml`` settings. Each factory takes no arguments and
+    returns a fresh, fully-configured ``Strategy`` instance.
+
+    Extracted from ``build_strategies`` so both the live runner AND
+    the offline backtest sweep (``scripts/sweep_backtest.py``) can
+    use the same parameter wiring — otherwise the sweep was
+    silently testing every strategy with bare ``Strategy.__init__``
+    defaults while the live bot ran with the tuned YAML values,
+    which produces backtest results that don't predict live
+    performance at all.
+    """
     settings = get_settings()
     scalper_cfg = settings.strategies.delta_perp_scalper
     sniper_cfg = settings.strategies.order_book_sniper
@@ -79,6 +92,7 @@ def build_strategies(names: List[str], portfolio: Portfolio) -> list:
     flow_cfg = settings.strategies.flow_scalp
     vwap_cfg = settings.strategies.micro_vwap_sniper
     sweep_cfg = settings.strategies.stop_hunt_reversal
+    mp_cfg = settings.strategies.money_printer
     avail = {
         "delta_perp_scalper": lambda: DeltaPerpetualScalper(
             zscore_window=scalper_cfg.zscore_window,
@@ -203,6 +217,22 @@ def build_strategies(names: List[str], portfolio: Portfolio) -> list:
             portfolio=portfolio,
             enabled=sweep_cfg.enabled,
         ),
+        "money_printer": lambda: MoneyPrinter(
+            bar_seconds=mp_cfg.bar_seconds,
+            feature_window_bars=mp_cfg.feature_window_bars,
+            win_threshold=mp_cfg.win_threshold,
+            hour_map_path=mp_cfg.hour_map_path,
+            model_path=mp_cfg.model_path,
+            min_atr_pct=mp_cfg.min_atr_pct,
+            max_atr_pct=mp_cfg.max_atr_pct,
+            tp_atr_mult=mp_cfg.tp_atr_mult,
+            sl_atr_mult=mp_cfg.sl_atr_mult,
+            max_hold_seconds=mp_cfg.max_hold_seconds,
+            notional_usd=mp_cfg.notional_usd,
+            leverage_hint=mp_cfg.leverage_hint,
+            portfolio=portfolio,
+            enabled=mp_cfg.enabled,
+        ),
         "tick_reversal_scalp": lambda: TickReversalScalp(
             min_streak=tick_cfg.min_streak,
             max_buffer_ticks=tick_cfg.max_buffer_ticks,
@@ -230,6 +260,16 @@ def build_strategies(names: List[str], portfolio: Portfolio) -> list:
             enabled=tick_cfg.enabled,
         ),
     }
+    return avail
+
+
+def build_strategies(names: List[str], portfolio: Portfolio) -> list:
+    """Construct the list of live strategies the engine should run.
+
+    See ``_strategy_factories`` for the parameter wiring; this just
+    expands the ``"all"`` sentinel and filters the factory map.
+    """
+    avail = _strategy_factories(portfolio)
     # "all" → expand to every available strategy. The DeltaEngine
     # constructor already drops strategies whose ``enabled`` flag is
     # False (see ``self.strategies = [s for s in strategies if s.enabled]``
@@ -244,6 +284,29 @@ def build_strategies(names: List[str], portfolio: Portfolio) -> list:
         if n in avail:
             out.append(avail[n]())
     return out
+
+
+def make_strategy(name: str, portfolio: Portfolio):
+    """Return ONE configured ``Strategy`` instance by name, or ``None``
+    if the name isn't registered. Convenience accessor used by the
+    offline backtest sweep so it shares the live runner's config-
+    driven wiring instead of reaching for bare ``__init__`` defaults.
+    """
+    avail = _strategy_factories(portfolio)
+    factory = avail.get(name)
+    return factory() if factory is not None else None
+
+
+STRATEGY_NAMES = (
+    "delta_perp_scalper",
+    "order_book_sniper",
+    "bid_ask_spread_fade",
+    "flow_scalp",
+    "micro_vwap_sniper",
+    "stop_hunt_reversal",
+    "money_printer",
+    "tick_reversal_scalp",
+)
 
 
 async def status_render(portfolio: Portfolio, engine: DeltaEngine, console: Console) -> None:
@@ -307,7 +370,10 @@ async def main() -> None:
         f"[bold cyan]aera · delta {mode}[/]  bankroll=${bankroll}"
     )
 
-    portfolio = Portfolio(bankroll=bankroll)
+    portfolio = Portfolio(
+        bankroll=bankroll,
+        dust_threshold_usd=float(settings.execution.min_order_size_usd),
+    )
     risk = RiskManager(settings.risk, portfolio)
 
     strategies = build_strategies(
@@ -393,7 +459,10 @@ async def main() -> None:
         # regime router (RANGE / TREND_* / HIGH_VOL / NEWS_SPIKE),
         # daily-loss circuit-breaker, gross-exposure cap. Mutes
         # losing strategies and shrinks size in bad regimes.
-        brain = AdaptiveBrain(settings.brain, portfolio)
+        brain = AdaptiveBrain(
+            settings.brain, portfolio,
+            taker_fee_bps=float(settings.execution.taker_fee_bps),
+        )
         if brain.enabled:
             console.print(
                 f"[bold cyan]adaptive brain ON[/] "

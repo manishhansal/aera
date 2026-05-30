@@ -73,6 +73,9 @@ def _move_market(market: Market, new_price: float, spread_bps: float = 50.0) -> 
 
 
 def _greedy_cfg(**overrides) -> GreedyConfig:
+    # Default to LEGACY USD mode for these unit tests so the math under
+    # test stays the fixed-USD math the assertions encode. New bps-mode
+    # tests opt in explicitly with ``tp_bps=...`` / ``sl_bps=...``.
     base = dict(
         enabled=True,
         min_profit_usd=1.0,
@@ -88,6 +91,11 @@ def _greedy_cfg(**overrides) -> GreedyConfig:
         respect_venue_cap=True,
         compound_fraction=0.90,
         fee_override_bps=0.0,
+        # Legacy USD mode (post-2026-05 the YAML default is bps mode).
+        tp_bps=0.0,
+        sl_bps=0.0,
+        extend_tp_step_bps=0.0,
+        trailing_giveback_bps=0.0,
     )
     base.update(overrides)
     return GreedyConfig(**base)
@@ -211,6 +219,93 @@ def test_fee_override_bps_takes_precedence():
     assert mgr.taker_fee_bps == 10.0
     # $200 notional × 10 bps × 2 legs = $0.40 round trip; + $0.50 = $0.90.
     assert mgr.tp_target_for(200.0) == pytest.approx(0.90)
+
+
+# ---------------------------------------------------------------------------
+# bps-of-notional TP / SL (the post-2026-05 default mode)
+# ---------------------------------------------------------------------------
+
+
+def test_tp_target_for_bps_mode_scales_with_notional():
+    """40 bps TP target on $2000 notional = $8.00; on $125 = $0.50.
+
+    The whole point of bps mode is that halving notional halves the
+    USD trigger so the required PRICE-MOVE % stays constant. This
+    fixes the failure mode where a $5 USD TP became a 4 % required
+    price move at $125 notional (= unreachable, every trade
+    timed out with random PnL drift).
+    """
+    cfg = _greedy_cfg(tp_bps=40.0, sl_bps=20.0, min_profit_usd=999.0)
+    portfolio = Portfolio(bankroll=100.0)
+    mgr = GreedyTradeManager(cfg, portfolio, taker_fee_bps=5.0)
+    # bps overrides min_profit_usd entirely — it is NOT additive.
+    assert mgr.tp_target_for(2000.0) == pytest.approx(8.0)
+    assert mgr.tp_target_for(125.0) == pytest.approx(0.5)
+    # SL mirrors with the opposite sign.
+    assert mgr.sl_level_for(2000.0) == pytest.approx(-4.0)
+    assert mgr.sl_level_for(125.0) == pytest.approx(-0.25)
+
+
+def test_tp_target_falls_back_to_usd_when_bps_disabled():
+    """When ``tp_bps == 0`` the manager reverts to the legacy
+    ``fees × pad + min_profit_usd`` formula — unchanged from earlier
+    versions so the fee_override / pad knobs still behave the same.
+    """
+    cfg = _greedy_cfg(tp_bps=0.0, sl_bps=0.0,
+                       min_profit_usd=1.0, fee_pad_multiple=1.0,
+                       initial_sl_usd=2.5)
+    portfolio = Portfolio(bankroll=27.0)
+    mgr = GreedyTradeManager(cfg, portfolio, taker_fee_bps=5.0)
+    # Fees = 500 × 5 bps × 2 = $0.50, plus $1 floor → $1.50.
+    assert mgr.tp_target_for(500.0) == pytest.approx(1.50)
+    # SL is the negation of initial_sl_usd, independent of notional.
+    assert mgr.sl_level_for(500.0) == pytest.approx(-2.5)
+    assert mgr.sl_level_for(125.0) == pytest.approx(-2.5)
+
+
+def test_bps_mode_stamps_per_position_extend_and_giveback():
+    """bps mode pre-computes the trailing give-back and TP extension
+    in USD terms at fill time, so the ratchet uses size-appropriate
+    values for that specific trade rather than the config defaults
+    (which would be wrong for the actual notional)."""
+    cfg = _greedy_cfg(
+        tp_bps=40.0, sl_bps=20.0,
+        extend_tp_step_bps=10.0, trailing_giveback_bps=8.0,
+        extend_tp_step_usd=0.0, trailing_giveback_usd=0.0,
+    )
+    portfolio = Portfolio(bankroll=100.0)
+    mgr = GreedyTradeManager(cfg, portfolio, taker_fee_bps=5.0)
+    fill = _entry_fill(price=100.0, size=12.5, leverage=10.0)  # $1250 notional
+    portfolio.apply_fill(fill)
+    mgr.on_execution(_exec_result("delta_perp_scalper", [fill]))
+    gp = mgr.positions[Portfolio._key("ETHUSD", "ETHUSD")]
+    assert gp.tp_target_usd == pytest.approx(5.0)         # 40 bps × $1250
+    assert gp.sl_level_usd == pytest.approx(-2.5)         # 20 bps × $1250
+    assert gp.extend_step_usd == pytest.approx(1.25)      # 10 bps × $1250
+    assert gp.trailing_giveback_usd == pytest.approx(1.0)  # 8 bps × $1250
+
+
+def test_bps_mode_tp_target_scales_when_compounder_shrinks_notional():
+    """Regression for the original "6 % win rate" failure: when the
+    actual fill notional collapses well below the ``min_profit_usd``
+    calibration, USD mode requires an unreachable price move; bps
+    mode keeps the price-move % constant.
+    """
+    cfg = _greedy_cfg(tp_bps=40.0, sl_bps=20.0)
+    portfolio = Portfolio(bankroll=100.0)
+    mgr = GreedyTradeManager(cfg, portfolio, taker_fee_bps=5.0)
+    # Tiny fill: 1.25 shares of a $100 contract = $125 notional.
+    fill = _entry_fill(price=100.0, size=1.25, leverage=25.0)
+    portfolio.apply_fill(fill)
+    mgr.on_execution(_exec_result("delta_perp_scalper", [fill]))
+    gp = mgr.positions[Portfolio._key("ETHUSD", "ETHUSD")]
+    # 40 bps of $125 = $0.50 (vs the $5 USD-mode value that needed a
+    # 4 % adverse price move to ever hit at this size).
+    assert gp.tp_target_usd == pytest.approx(0.5)
+    # Price needs to move +50 bps in our favour, i.e. $100 → $100.40,
+    # to hit the TP — well inside the hold window's noise band.
+    required_price_move_pct = gp.tp_target_usd / (gp.entry_shares * gp.entry_price)
+    assert required_price_move_pct == pytest.approx(0.004)  # 40 bps
 
 
 # ---------------------------------------------------------------------------

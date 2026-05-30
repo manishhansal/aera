@@ -78,6 +78,14 @@ class _GreedyPosition:
     best_pnl_usd: float = 0.0
     # Strategy that emitted the original entry, for logging.
     source_strategy: str = ""
+    # When > 0 the manager is in BPS-OF-NOTIONAL mode: thresholds are
+    # derived dynamically from ``entry_notional × bps × 1e-4`` so the
+    # trade auto-scales with whatever the compounder actually opened.
+    # When 0 the position falls back to the legacy absolute-USD
+    # thresholds (``min_profit_usd`` / ``initial_sl_usd`` /
+    # ``extend_tp_step_usd``).
+    extend_step_usd: float = 0.0
+    trailing_giveback_usd: float = 0.0
 
 
 @dataclass
@@ -190,12 +198,62 @@ class GreedyTradeManager:
     def tp_target_for(self, notional_usd: float) -> float:
         """Compute the initial TP target in USD-PnL space.
 
-        ``target = round_trip_fees × fee_pad_multiple + min_profit_usd``
+        Two modes, picked by ``cfg.tp_bps``:
+
+        * **bps mode** (``tp_bps > 0``, the post-2026-05 default):
+          ``target = notional × tp_bps × 1e-4``. The TP trigger is
+          a fixed fraction of the actual entry notional so a $125
+          trade and a $2000 trade both require the same price-move %
+          to lock in. This is the only mode that produces consistent
+          behaviour across compounding sizers — without it, halving
+          notional doubles the required price move and rapidly
+          becomes unreachable inside the hold window.
+
+        * **legacy USD mode** (``tp_bps == 0``):
+          ``target = round_trip_fees × fee_pad_multiple + min_profit_usd``.
+          Kept for backward-compat; flip ``tp_bps`` back on once
+          you've calibrated bps thresholds.
         """
+        tp_bps = float(getattr(self.cfg, "tp_bps", 0.0) or 0.0)
+        if tp_bps > 0 and notional_usd > 0:
+            return notional_usd * tp_bps * 1e-4
         fees = self.estimate_round_trip_fee_usd(notional_usd)
         return fees * max(0.0, self.cfg.fee_pad_multiple) + max(
             0.0, self.cfg.min_profit_usd
         )
+
+    def sl_level_for(self, notional_usd: float) -> float:
+        """Compute the initial SL trigger in USD-PnL space (always ≤ 0).
+
+        Mirrors :meth:`tp_target_for` — bps-of-notional when
+        ``cfg.sl_bps > 0``, else the legacy ``-initial_sl_usd``
+        constant. Returning a non-positive value keeps the ratchet
+        math (SL only moves up) consistent across modes.
+        """
+        sl_bps = float(getattr(self.cfg, "sl_bps", 0.0) or 0.0)
+        if sl_bps > 0 and notional_usd > 0:
+            return -abs(notional_usd * sl_bps * 1e-4)
+        return -abs(float(self.cfg.initial_sl_usd))
+
+    def extend_step_for(self, notional_usd: float) -> float:
+        """Per-position TP extension step (USD).
+
+        bps mode: ``notional × extend_tp_step_bps × 1e-4``.
+        USD mode: ``cfg.extend_tp_step_usd`` (unchanged legacy value).
+        """
+        ext_bps = float(getattr(self.cfg, "extend_tp_step_bps", 0.0) or 0.0)
+        tp_bps = float(getattr(self.cfg, "tp_bps", 0.0) or 0.0)
+        if tp_bps > 0 and ext_bps > 0 and notional_usd > 0:
+            return notional_usd * ext_bps * 1e-4
+        return max(0.0, float(self.cfg.extend_tp_step_usd))
+
+    def trailing_giveback_for(self, notional_usd: float) -> float:
+        """Per-position trailing give-back (USD)."""
+        gb_bps = float(getattr(self.cfg, "trailing_giveback_bps", 0.0) or 0.0)
+        sl_bps = float(getattr(self.cfg, "sl_bps", 0.0) or 0.0)
+        if sl_bps > 0 and gb_bps > 0 and notional_usd > 0:
+            return notional_usd * gb_bps * 1e-4
+        return max(0.0, float(self.cfg.trailing_giveback_usd))
 
     # ------------------------------------------------------------------
     # execution-result subscriber
@@ -243,6 +301,9 @@ class GreedyTradeManager:
         if getattr(fill, "fee", 0.0):
             fees_round_trip = max(fees_round_trip, float(fill.fee) * 2.0)
         tp_target = self._initial_tp_target(notional, fees_round_trip)
+        sl_level = self.sl_level_for(notional)
+        extend_step = self.extend_step_for(notional)
+        trailing_giveback = self.trailing_giveback_for(notional)
 
         existing = self._positions.get(key)
         if existing is None or existing.side != side:
@@ -257,20 +318,22 @@ class GreedyTradeManager:
                 entry_time=float(fill.timestamp or self._clock()),
                 fees_round_trip_usd=float(fees_round_trip),
                 tp_target_usd=float(tp_target),
-                sl_level_usd=-float(max(0.0, self.cfg.initial_sl_usd)),
+                sl_level_usd=float(sl_level),
                 best_pnl_usd=0.0,
                 source_strategy=source_strategy,
+                extend_step_usd=float(extend_step),
+                trailing_giveback_usd=float(trailing_giveback),
             )
             log.debug(
-                "greedy: tracking %s %s shares=%g price=%g lev=%g "
-                "fees=$%.4f tp=$%.4f sl=$%.4f",
+                "greedy: tracking %s %s shares=%g price=%g lev=%g notional=$%.2f "
+                "fees=$%.4f tp=$%.4f sl=$%.4f ext=$%.4f gb=$%.4f",
                 fill.market_id, side, abs(pos.shares), pos.avg_cost,
-                getattr(fill, "leverage", 1.0), fees_round_trip,
-                tp_target, -max(0.0, self.cfg.initial_sl_usd),
+                getattr(fill, "leverage", 1.0), notional, fees_round_trip,
+                tp_target, sl_level, extend_step, trailing_giveback,
             )
         else:
             # Same-side add: refresh shares / avg cost; keep best PnL
-            # but recompute fees + tp_target for the new notional.
+            # but recompute fees + tp_target + sl for the new notional.
             existing.entry_price = float(pos.avg_cost)
             existing.entry_shares = float(abs(pos.shares))
             existing.entry_notional = float(notional)
@@ -280,30 +343,38 @@ class GreedyTradeManager:
             existing.tp_target_usd = max(
                 existing.tp_target_usd, float(tp_target)
             )
+            # SL recomputes to the new notional but only ever moves UP
+            # toward profit (the trailing ratchet's invariant).
+            existing.sl_level_usd = max(existing.sl_level_usd, float(sl_level))
+            existing.extend_step_usd = float(extend_step)
+            existing.trailing_giveback_usd = float(trailing_giveback)
             log.debug(
-                "greedy: refreshed %s shares=%g notional=$%.2f tp=$%.4f",
+                "greedy: refreshed %s shares=%g notional=$%.2f tp=$%.4f sl=$%.4f",
                 fill.market_id, existing.entry_shares,
                 existing.entry_notional, existing.tp_target_usd,
+                existing.sl_level_usd,
             )
         self.stats.open_positions = len(self._positions)
 
     def _initial_tp_target(self, notional: float, fees_round_trip: float) -> float:
-        """TP target = fees × fee_pad_multiple + min_profit_usd.
+        """Compute the initial TP target for a fill of ``notional`` size.
 
-        Position-PnL trigger that, after the exit fee is paid, leaves
-        ``min_profit_usd`` of net realised profit. Fees enter the
-        trigger because position PnL is price-only — the exchange will
-        deduct entry + exit fees from cash separately.
+        In bps mode (``cfg.tp_bps > 0``) returns ``notional × tp_bps × 1e-4``
+        — the price-move % required to hit TP stays constant regardless of
+        how much the compounding sizer actually opened.
 
-        Note: the SL counterpart is *not* fee-padded — it sits at
-        ``-initial_sl_usd`` of position PnL, so realised loss after
-        the exit fee is ``-(initial_sl_usd + fees)``. This is by design
-        — adding fees to the SL trigger would *double-count* them
-        (realised loss becomes ``-(initial_sl_usd + 2×fees)``). The
-        proper way to keep absolute losses bounded as bankroll grows
-        is the ``max_notional_usd`` cap, which keeps fees themselves
-        bounded.
+        In legacy USD mode returns
+        ``fees_round_trip × fee_pad_multiple + min_profit_usd``. Position-PnL
+        trigger that, after the exit fee is paid, leaves ``min_profit_usd``
+        of net realised profit. The SL counterpart sits at
+        ``-initial_sl_usd`` of position PnL, so realised loss after the exit
+        fee is ``-(initial_sl_usd + fees)``. Adding fees to the SL trigger
+        would *double-count* them; the proper way to bound absolute losses
+        as bankroll grows is the ``max_notional_usd`` cap.
         """
+        tp_bps = float(getattr(self.cfg, "tp_bps", 0.0) or 0.0)
+        if tp_bps > 0 and notional > 0:
+            return notional * tp_bps * 1e-4
         return (
             fees_round_trip * max(0.0, self.cfg.fee_pad_multiple)
             + max(0.0, self.cfg.min_profit_usd)
@@ -415,10 +486,14 @@ class GreedyTradeManager:
         Behaviour:
           * Update ``best_pnl_usd`` to the running max.
           * Once ``best_pnl_usd >= lock_in_trigger_ratio × tp_target``,
-            raise SL to ``best_pnl_usd − trailing_giveback_usd``. SL
+            raise SL to ``best_pnl_usd − trailing_giveback``. SL
             never moves down.
           * If profit exceeds the current TP target, extend the target
-            by ``extend_tp_step_usd`` so a winner keeps running.
+            by the per-position extend step so a winner keeps running.
+
+        Uses the per-position ``extend_step_usd`` and ``trailing_giveback_usd``
+        when set (bps mode stamps these at entry from the actual notional),
+        falling back to the config-level USD values for legacy mode.
         """
         if pnl_usd > gp.best_pnl_usd:
             gp.best_pnl_usd = pnl_usd
@@ -426,12 +501,15 @@ class GreedyTradeManager:
         # Trailing ratchet
         lock_in_at = gp.tp_target_usd * max(0.0, self.cfg.lock_in_trigger_ratio)
         if gp.best_pnl_usd >= lock_in_at and lock_in_at > 0:
-            new_sl = gp.best_pnl_usd - max(0.0, self.cfg.trailing_giveback_usd)
+            gb = float(gp.trailing_giveback_usd) if gp.trailing_giveback_usd > 0 \
+                else max(0.0, self.cfg.trailing_giveback_usd)
+            new_sl = gp.best_pnl_usd - gb
             if new_sl > gp.sl_level_usd:
                 gp.sl_level_usd = new_sl
 
         # Greedy extension: roll TP forward past the current high.
-        ext = max(0.0, self.cfg.extend_tp_step_usd)
+        ext = float(gp.extend_step_usd) if gp.extend_step_usd > 0 \
+            else max(0.0, self.cfg.extend_tp_step_usd)
         if ext > 0 and gp.best_pnl_usd >= gp.tp_target_usd:
             gp.tp_target_usd = gp.best_pnl_usd + ext
 

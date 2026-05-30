@@ -6,6 +6,7 @@ from .bid_ask_spread_fade import BidAskSpreadFade
 from .flow_scalp import FlowScalp
 from .micro_vwap_sniper import MicroVWAPSniper
 from .stop_hunt_reversal import StopHuntReversal
+from .money_printer import MoneyPrinter
 
 __all__ = [
     "Strategy",
@@ -18,4 +19,5 @@ __all__ = [
     "FlowScalp",
     "MicroVWAPSniper",
     "StopHuntReversal",
+    "MoneyPrinter",
 ]

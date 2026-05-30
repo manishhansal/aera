@@ -216,7 +216,8 @@
         <section class="card list-card half">
             <div class="card-header">
                 <h2>open positions <span class="muted" id="positions-count">0</span></h2>
-                <span class="badge" id="exp-net">net $0</span>
+                <span class="badge" id="positions-upnl">uPnL $0.00</span>
+                <span class="badge" id="exp-net">exposure $0</span>
             </div>
             <div class="table-wrap">
                 <table class="data">
@@ -226,12 +227,13 @@
                             <th>side</th>
                             <th>shares</th>
                             <th>avg cost</th>
-                            <th>realised</th>
+                            <th>mark</th>
+                            <th>uPnL</th>
                             <th>notional</th>
                         </tr>
                     </thead>
                     <tbody id="positions-body">
-                        <tr class="empty"><td colspan="6">flat — no open positions</td></tr>
+                        <tr class="empty"><td colspan="7">flat — no open positions</td></tr>
                     </tbody>
                 </table>
             </div>

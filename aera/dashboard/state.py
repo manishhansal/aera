@@ -204,6 +204,11 @@ class DashboardState:
         # number of markets currently in the universe (set on every refresh)
         self.markets_count: int = 0
         self.top_markets: List[dict] = []
+        # Latest mid per market — populated by ``record_markets`` on every
+        # engine refresh. Used by ``open_positions`` to compute unrealised
+        # PnL without dragging the live Market objects through the
+        # dashboard render path. Empty until the first refresh lands.
+        self._market_mids: Dict[str, float] = {}
 
         # seed the equity curve with the starting bankroll so charts have a point
         self.record_equity_sample()
@@ -460,6 +465,18 @@ class DashboardState:
 
     def record_markets(self, markets: Dict[str, "Market"]) -> None:
         self.markets_count = len(markets)
+        # Refresh per-market mids so unrealised-PnL views (open positions)
+        # don't go stale. Stored as a flat ``market_id -> mid`` map; the
+        # first outcome's mid is "the" price for perps (single outcome
+        # markets), which is the only case the live bot trades today.
+        fresh_mids: Dict[str, float] = {}
+        for m in markets.values():
+            for o in m.outcomes.values():
+                mid = o.mid
+                if mid and mid > 0:
+                    fresh_mids[m.id] = float(mid)
+                    break
+        self._market_mids = fresh_mids
         # rank by 24h volume for the watchlist panel
         ranked = sorted(
             markets.values(),
@@ -706,14 +723,28 @@ class DashboardState:
             # positions" with $0.00 notional and shares displayed as 0.00.
             if abs(pos.shares) < 1e-9:
                 continue
+            mark = self._market_mids.get(pos.market_id)
+            # Unrealised PnL is the only PnL number that's *meaningful* on
+            # an open position. ``Position.realised_pnl`` only accumulates
+            # when a close fill comes in, so for still-open legs it is
+            # tautologically zero and confuses operators reading the panel.
+            # We compute uPnL against the latest cached mid; if we haven't
+            # seen a tick for that market yet we fall back to avg_cost
+            # (uPnL = 0), which is the conservative default.
+            if mark is None or mark <= 0:
+                mark = pos.avg_cost
+            unrealised = (mark - pos.avg_cost) * pos.shares
+            notional = pos.notional_exposure(mark)
             out.append(
                 {
                     "market_id": pos.market_id,
                     "outcome_id": pos.outcome_id,
                     "shares": pos.shares,
                     "avg_cost": pos.avg_cost,
+                    "mark": mark,
                     "realised_pnl": pos.realised_pnl,
-                    "notional": pos.notional_exposure(pos.avg_cost),
+                    "unrealised_pnl": unrealised,
+                    "notional": notional,
                 }
             )
         return out

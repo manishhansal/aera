@@ -1,7 +1,7 @@
 # aera
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-314%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-397%20passing-brightgreen.svg)](#testing)
 [![License](https://img.shields.io/badge/license-personal--use-lightgrey.svg)](#disclaimers)
 
 **Repository:** <https://github.com/manishhansal/aera>
@@ -10,10 +10,15 @@
 > Mean-reversion + order-flow + sweep + market-making scalping on
 > USD-quoted perps, with an **adaptive brain** that measures each
 > strategy's live edge, mutes the losing ones, vetoes signals in the
-> wrong regime, and enforces a daily-loss circuit breaker — wrapped in
-> a greedy autopilot that compounds the survivors aggressively.
-> Leverage-aware sizing, hard risk caps, absolute-USD take-profit /
-> stop-loss, paper-trading, and a live web dashboard.
+> wrong regime, applies post-loss cool-downs to prevent revenge
+> trading, and enforces a daily-loss circuit breaker — wrapped in a
+> greedy autopilot that compounds the survivors aggressively. Plus
+> an **offline backtest + ML training pipeline** that powers a
+> backtest-trained adaptive strategy (`money_printer`) which only
+> fires during historically profitable hours when a gradient-boosted
+> classifier agrees. Leverage-aware sizing, hard risk caps,
+> absolute-USD take-profit / stop-loss, paper-trading, and a live
+> web dashboard.
 
 ```
  Delta Exchange (REST + WSS)                                 USDC / margin
@@ -21,14 +26,14 @@
         v                                                          |
 +----------------+   markets[]   +----------------+   signals[]   +-----------+   filtered    +----------+   orders
 |  DeltaClient   |-------------->|   Strategies   |-------------->|  Greedy   |-------------->|  Brain   |---------+
-|  + Websocket   |               |  (7 scalpers)  |               |  TP/SL/   |               |  regime  |         |
-+----------------+               +----------------+               |  leverage |               |  + edge  |         |
-                                                                  +-----------+               +----------+         |
-                                                                                                   |               |
-                                                                                                   v               |
-                                                                                              +----------+         |
-                                                                                              | Executor |---------+
-                                                                                              +----------+
+|  + Websocket   |               |  (8 strats inc.|               |  TP/SL/   |               |  regime  |         |
++----------------+               |  money_printer)|               |  leverage |               |  + edge  |         |
+                                 +----------------+               +-----------+               +----------+         |
+                                          ^                                                        |               |
+                  hour_maps.json +        |                                                        v               |
+                  model.joblib   ────────-+                                                  +----------+           |
+                  (from offline                                                              | Executor |-----------+
+                  backtest+ML pipeline)                                                      +----------+
                                                                                                    |   ^
                                                                                              fills v   | bankroll
                                                                                              +-----------+
@@ -54,17 +59,19 @@
 8. [Strategy: Tape Reading Momentum (Flow Scalp)](#strategy-tape-reading-momentum-flow-scalp)
 9. [Strategy: Micro VWAP Reversion Sniper](#strategy-micro-vwap-reversion-sniper)
 10. [Strategy: Stop Hunt / Liquidity Grab Reversal](#strategy-stop-hunt--liquidity-grab-reversal)
-11. [Take-profit / stop-loss](#take-profit--stop-loss)
-12. [Greedy autopilot](#greedy-autopilot)
-13. [Adaptive brain](#adaptive-brain)
-14. [Risk management](#risk-management)
-15. [Configuration](#configuration)
-16. [Installation](#installation)
-17. [CLI reference](#cli-reference)
-18. [Live web dashboard](#live-web-dashboard)
-19. [Going live](#going-live)
-20. [Testing](#testing)
-21. [Disclaimers](#disclaimers)
+11. [Strategy: Money Printer (backtest-trained adaptive)](#strategy-money-printer-backtest-trained-adaptive)
+12. [Take-profit / stop-loss](#take-profit--stop-loss)
+13. [Greedy autopilot](#greedy-autopilot)
+14. [Adaptive brain](#adaptive-brain)
+15. [Risk management](#risk-management)
+16. [Offline backtest + ML pipeline](#offline-backtest--ml-pipeline)
+17. [Configuration](#configuration)
+18. [Installation](#installation)
+19. [CLI reference](#cli-reference)
+20. [Live web dashboard](#live-web-dashboard)
+21. [Going live](#going-live)
+22. [Testing](#testing)
+23. [Disclaimers](#disclaimers)
 
 ---
 
@@ -90,7 +97,19 @@ python -m scripts.run_dashboard --bankroll 27
 # 5. Bankroll-growth Monte Carlo (pure math, no internet)
 python -m scripts.simulate_growth
 
-# 6. Tests
+# 6. Offline backtest + ML training pipeline (powers money_printer)
+python -m scripts.fetch_history   --symbols BTCUSD,ETHUSD,SOLUSD \
+                                  --resolutions 1m,5m --days 90
+python -m scripts.sweep_backtest  --symbols BTCUSD,ETHUSD,SOLUSD \
+                                  --resolutions 1m,5m --leverages 5,10,25
+python -m scripts.train_money_printer       # single GBT classifier (always)
+python -m scripts.train_ensemble            # per-symbol ensemble (optional)
+python -m scripts.train_rl_agent --symbol BTCUSD --resolution 5m  # DQN (optional)
+# pip install -r requirements-ml-extras.txt   # only needed for the transformer
+# python -m scripts.train_sequence_model      # transformer encoder (optional)
+python -m scripts.run_delta --bankroll 27 --strategies money_printer --dashboard
+
+# 7. Tests
 python -m pytest -q
 ```
 
@@ -127,11 +146,27 @@ For live trading, drop your Delta credentials into `.env` (`DELTA_API_KEY` /
   aggressive compounding (see *Greedy autopilot* section).
 * `AdaptiveBrain` — live edge tracker + regime router. Mutes
   underperforming strategies, vetoes fresh entries during news
-  spikes / wrong regimes, enforces a daily-loss circuit breaker and
-  a gross-exposure correlation cap (see *Adaptive brain* section).
+  spikes / wrong regimes, applies a per-(strategy, symbol) post-loss
+  cool-down to suppress revenge trades, enforces a daily-loss circuit
+  breaker and a gross-exposure correlation cap, and **tags every
+  vetoed signal** so the dashboard can show *why* it was rejected
+  (see *Adaptive brain* section).
 * `RegimeBook` — per-symbol classifier that streams every mid into
   a RANGE / TREND_* / HIGH_VOL / NEWS_SPIKE detector; the brain
   consumes its snapshots to route signals.
+* `MoneyPrinter` — adaptive strategy trained from the offline
+  pipeline. Only fires during historically profitable hours (per-
+  symbol heatmap) **and** when an `sklearn` gradient-boosted
+  classifier estimates `P(win) >= min_win_probability` **and**
+  ATR% is inside the configured volatility band. Exits are ATR-
+  tuned. Degrades gracefully when artefacts are missing
+  (see *Strategy: Money Printer*).
+* `aera.data.history`, `aera.backtest.{replay,sweep,analysis}`,
+  `aera.ml.{features,model}` — the **offline pipeline** that
+  fetches OHLCV, replays every existing strategy across (symbol ×
+  resolution × leverage), produces per-hour profitability heatmaps,
+  and trains the gradient-boosted classifier that powers MoneyPrinter
+  (see *Offline backtest + ML pipeline*).
 * `DeltaPaperExchange` — simulates fills against the live order book using a
   slippage model. Useful for risk-free testing on real market data.
 * `DeltaLiveExchange` — routes orders to the real Delta REST API.
@@ -164,20 +199,44 @@ aera/
 ├── strategies/            Strategy base + DeltaPerpetualScalper +
 │                          OrderBookSniper + TickReversalScalp +
 │                          BidAskSpreadFade + FlowScalp + MicroVWAPSniper +
-│                          StopHuntReversal
+│                          StopHuntReversal + MoneyPrinter
+│                          (all strategies call base.sync_position_state at
+│                          the top of every scan to prevent phantom positions)
 ├── execution/             Executor, slippage, Delta paper / live exchanges
+├── data/                  History layer: Delta /v2/history/candles client +
+│                          local Parquet/CSV cache (CandleStore)
+├── backtest/              BarReplay engine + multi-axis sweep + per-hour
+│                          profitability analysis (HourMap)
+├── ml/                    Feature engineering (15 features) + sklearn
+│                          gradient-boosted profitability classifier
 ├── dashboard/             FastAPI server + state container + static UI
 ├── settings.py            Pydantic config schema with env / YAML layering
 └── logging.py             Rich console logger
 
-scripts/                   Entry points (scan_delta, run_delta, run_dashboard,
-                           simulate_growth)
+scripts/                   Entry points:
+  scan_delta.py            Read-only product/order-book scanner
+  run_delta.py             Main paper / live runner
+  run_dashboard.py         run_delta + dashboard wrapper
+  simulate_growth.py       Pure-math Monte Carlo
+  fetch_history.py         Cache N days of OHLCV
+  backtest.py              Single-config backtest
+  sweep_backtest.py        Grid sweep -> CSV summaries + hour_maps.json
+  train_money_printer.py   Fit MoneyPrinter's ML model (model.joblib)
+  train_ensemble.py        Fit per-symbol classifier ensemble (data/money_printer/ensemble/)
+  train_sequence_model.py  Fit transformer encoder (needs torch; sequence_model.pt)
+  train_rl_agent.py        Fit DQN trading agent (rl_policy.npz)
+
 config/config.yaml         Single source of truth for runtime knobs
-tests/                     pytest suite (314 tests)
+data/                      Runtime caches (gitignored / cursorignored):
+  history/<SYM>/<res>.parquet     Cached OHLCV
+  backtest/sweep_*.csv            Sweep summaries
+  money_printer/{hour_maps.json,  MoneyPrinter artefacts (consumed live)
+                 model.joblib}
+tests/                     pytest suite (397 tests)
 .env.example               Template for live credentials
 .gitignore                 Standard Python + project-local exclusions
 .cursorignore              Cursor IDE indexing exclusions (mirrors .gitignore +
-                           large static UI bundles)
+                           runtime data caches + large static UI bundles)
 CONTEXT.md                 Compact project map for AI assistants / new
                            contributors (architecture, conventions, gotchas)
 ```
@@ -776,6 +835,109 @@ python -m scripts.run_delta \
 
 ---
 
+## Strategy: Money Printer (backtest-trained adaptive)
+
+The eighth strategy is fundamentally different from the other
+seven: it does not invent its edge from first principles. It
+**reads** an edge from an offline backtest pipeline and an
+ML-trained classifier, and trades only when the historical
+evidence, the model, and current volatility all agree.
+
+Off by default; flip `strategies.money_printer.enabled` to `true`
+in `config/config.yaml`. **Train the artefacts first** (see the
+*Offline backtest + ML pipeline* section); MoneyPrinter degrades
+gracefully when artefacts are missing but adds the least value in
+that mode.
+
+**Inputs (read at construction time):**
+
+* `data/money_printer/hour_maps.json` — per-(strategy, symbol)
+  expected PnL by UTC hour-of-day. Produced by `scripts.sweep_backtest`.
+* `data/money_printer/model.joblib` — a `sklearn.ensemble.HistGradientBoostingClassifier`
+  predicting `P(win)` from 15 microstructure / volatility / time
+  features. Produced by `scripts.train_money_printer`.
+
+If either is missing the strategy still scans, but the
+corresponding gate is disabled (logged once at INFO).
+
+**Per-symbol scan logic (every tick):**
+
+1. **Phantom-position sync** — every scan first reconciles the
+   strategy's "I have an open position" bookkeeping with the
+   `Portfolio` (same guard rail every other strategy uses).
+2. **Bar aggregation** — append the latest mid to a rolling
+   `_Bar` deque (default 200 bars, 60s buckets). Below
+   `min_bars` (default 30) the strategy returns flat.
+3. **Hour-of-day gate** — look up the current UTC hour for
+   `(money_printer, <symbol>)` in the hour map. If the historical
+   expectancy ≤ 0, skip.
+4. **ATR band gate** — compute ATR% from the rolling bars. If it
+   falls outside `[min_atr_pct, max_atr_pct]` (defaults 0.10% /
+   1.50%), skip — too quiet to profit, too violent to control.
+5. **ML P(win) gate** — extract a 15-feature vector and call
+   `predict_proba_win`. If the probability < `min_win_probability`
+   (default 0.55), skip.
+6. **Side selection** — when the ML model is available, use a
+   feature-derived directional bias (returns, RSI, EMA deviation,
+   wick imbalance). Without a model, fall back to mean-reversion
+   against the local mid.
+7. **Confidence-scaled entry** — stamp `metadata["confidence"]`
+   = ML score onto the leg; the executor reads it and tilts the
+   final notional toward higher-confidence trades.
+
+**Exits (highest priority first):**
+
+1. **Max hold** — `now − entry_time > max_hold_seconds` (default
+   180s). Flatten.
+2. **ATR-tuned stop-loss** — `entry × (1 − sl_atr_mult × atr_pct)`
+   for longs; mirror for shorts. Volatility-adaptive: a quiet
+   market gets a tight stop, a noisy one gets room to breathe.
+3. **ATR-tuned take-profit** — `entry × (1 + tp_atr_mult × atr_pct)`
+   for longs; mirror for shorts. Same volatility scaling as the
+   stop, with a wider multiplier by default (2.0× vs. 1.0×) so
+   the strategy targets a 2:1 reward-to-risk per trade.
+
+**Config knobs (`config/config.yaml -> strategies.money_printer:`)**
+
+```yaml
+strategies:
+  money_printer:
+    enabled: false              # opt-in; train artefacts first
+    bar_seconds: 60             # rolling bar length
+    max_bars: 200               # rolling window depth
+    min_bars: 30                # don't trade before warm-up
+    atr_window: 14
+    min_atr_pct: 0.0010         # 0.10% — too quiet below this
+    max_atr_pct: 0.0150         # 1.50% — too violent above
+    tp_atr_mult: 2.0            # TP = entry × (1 + 2 × ATR%)
+    sl_atr_mult: 1.0            # SL = entry × (1 − 1 × ATR%)
+    min_win_probability: 0.55   # ML P(win) gate
+    max_hold_seconds: 180.0
+    hour_map_path: "data/money_printer/hour_maps.json"
+    model_path:    "data/money_printer/model.joblib"
+    rearm_distance_bps: 5.0
+```
+
+The strategy is regime-agnostic on purpose — its hour map and ML
+score already encode regime context implicitly, so the brain's
+`STRATEGY_REGIME_PREFS` map lists every regime as allowed for it.
+
+```bash
+# Once the offline pipeline has produced hour_maps.json + model.joblib:
+python -m scripts.run_delta \
+    --strategies money_printer \
+    --symbols BTCUSD,ETHUSD,SOLUSD \
+    --bankroll 27 --websocket --dashboard
+
+# Stack it with the seven hand-built strategies; the brain
+# automatically attributes PnL per-strategy and mutes losers.
+python -m scripts.run_delta \
+    --strategies delta_perp_scalper,money_printer \
+    --bankroll 27 --dashboard
+```
+
+---
+
 ## Take-profit / stop-loss
 
 The scalper supports two exit modes — pick one (or mix per-symbol).
@@ -943,19 +1105,26 @@ BOT_GREEDY_COMPOUND_FRACTION=0.95 BOT_GREEDY_MIN_PROFIT_USD=2.0 \
 A live overlay (`aera.core.AdaptiveBrain`) that **measures the bot's own
 edge in real time and refuses to trade when the edge isn't there.**
 Sits between the strategies and the executor — *after* greedy's flatten
-signals, *before* the risk vet — and applies four classes of veto /
+signals, *before* the risk vet — and applies five classes of veto /
 shrink rule to every fresh entry:
 
-| Gate                  | What it does                                                                     |
-| --------------------- | -------------------------------------------------------------------------------- |
-| **Performance gate**  | Auto-mutes a strategy when its rolling win-rate / expectancy crashes             |
-| **Regime gate**       | Mean-reversion only in RANGE; flow-scalp only in TREND_*; NEWS_SPIKE vetoes all  |
-| **Daily-loss cap**    | Halts new entries when 24h realised PnL drops below `-daily_loss_pct × bankroll` |
-| **Correlation cap**   | Caps total gross long (or short) notional across all symbols                     |
+| Gate                       | What it does                                                                     |
+| -------------------------- | -------------------------------------------------------------------------------- |
+| **Performance gate**       | Auto-mutes a strategy when its rolling win-rate / expectancy crashes             |
+| **Regime gate**            | Mean-reversion only in RANGE; flow-scalp only in TREND_*; NEWS_SPIKE vetoes all  |
+| **Post-loss cool-down**    | After ANY losing trade, the *(strategy, symbol)* pair waits N seconds before re-firing |
+| **Daily-loss cap**         | Halts new entries when 24h realised PnL drops below `-daily_loss_pct × bankroll` |
+| **Correlation cap**        | Caps total gross long (or short) notional across all symbols                     |
 
 Reduce-only legs (TP / SL closes, greedy flattens) **always flow**
 through the brain regardless of state — the brain only ever shrinks or
 vetoes fresh entries, never blocks the bot from getting flat.
+
+**Every vetoed signal is tagged** with `metadata["brain_veto_reason"]`
+before being dropped, and surfaced to the dashboard via a synthetic
+rejected `ExecutionResult` so the user can read *why* a fire was
+suppressed (e.g. `brain: post-loss cool-down on BTCUSD (47s left)` or
+`brain: muted (win-rate 0.18 < 0.40 over 12 trades)`).
 
 ### Per-strategy performance tracker
 
@@ -973,13 +1142,29 @@ Mute fires when ANY of the following is true after at least
 
 * rolling win-rate < `min_win_rate` (default 0.40),
 * rolling expectancy < `min_expectancy_usd` (default 0.0),
-* consecutive losses ≥ `max_strategy_loss_streak` (default 4).
+* consecutive losses ≥ `max_strategy_loss_streak` (default 2 —
+  intentionally aggressive; two consecutive losses is enough
+  evidence to step back).
 
 A muted strategy stops emitting fresh entries for `mute_seconds`
 (default 600s = 10 min). After the cooldown it returns *on probation*
 at `probation_size_mult` (default 0.5 = half size) and stays there
 until it logs `probation_trades` (default 5) closed trades with
 non-negative average expectancy — then it graduates back to 1.0.
+
+### Post-loss cool-down (per strategy × symbol)
+
+Independently of the per-strategy mute, every losing trade arms a
+short per-(strategy, symbol) cool-down (default 60s). During the
+cool-down the brain refuses fresh entries from *that exact pair*
+and tags the rejection `brain: post-loss cool-down on <symbol>
+(<N>s left)`. Other symbols on the same strategy are unaffected,
+so a single bad SOLUSD trade won't shut down BTCUSD scalping.
+
+This is the bot's revenge-trade suppressor: a quick stop-out almost
+always means the immediate microstructure thesis (mean-reversion
+level, wall, exhaustion print) is invalidated, and re-firing inside
+seconds is the highest-loss-probability move in the dataset.
 
 ### Regime detector
 
@@ -1004,6 +1189,14 @@ Each strategy declares which regimes its signals are appropriate for
 | `micro_vwap_sniper`      | RANGE, UNKNOWN                              |
 | `stop_hunt_reversal`     | RANGE, UNKNOWN                              |
 | `flow_scalp`             | TREND_UP, TREND_DOWN, UNKNOWN               |
+| `money_printer`          | ALL (regime context is encoded in ML score) |
+
+By default the regime gate is a **soft veto**: signals outside the
+allow-list are still emitted, but the brain shrinks them by
+`wrong_regime_size_mult` (default 0.5) instead of dropping them
+outright. Set `regime_soft_veto: false` for the old hard-veto
+behaviour. NEWS_SPIKE is always a hard veto regardless of this
+flag.
 
 HIGH_VOL doesn't appear in any allow-list — it's the brain's
 *shrink* signal, not a veto. The size multiplier is multiplied by
@@ -1022,12 +1215,15 @@ catches multi-day bleed past this point.
 
 ### Correlation / gross-exposure cap
 
-`max_gross_exposure_mult × settled_wealth` is the brain's per-side
+`max_gross_exposure_mult × bankroll × leverage` (i.e. scaled with
+**buying power**, not just settled wealth) is the brain's per-side
 (long / short) gross-notional ceiling across every symbol it touches.
-With the default 2.0× and a $100 bankroll, total long notional is
-capped at $200 — so the brain refuses to let the bot end up 100%
-directional crypto on a single bad tick where BTC / ETH / SOL all
-fire in the same direction simultaneously.
+With the default 2.0×, a $100 bankroll, and 50× leverage, total
+long notional is capped at `2 × 100 × 50 = $10,000` — so the brain
+refuses to let the bot end up 100% directional crypto on a single
+bad tick where BTC / ETH / SOL all fire in the same direction
+simultaneously, *but* without strangling the leveraged scalper down
+to one-trade-at-a-time the way a `× settled_wealth` cap would.
 
 ### Per-strategy dynamic sizing
 
@@ -1056,19 +1252,22 @@ brain:
   perf_window: 30
   min_win_rate: 0.40
   min_expectancy_usd: 0.0
-  max_strategy_loss_streak: 4
+  max_strategy_loss_streak: 2          # 2 consecutive losses -> mute
   mute_seconds: 600.0
   probation_trades: 5
   probation_size_mult: 0.5
+  post_loss_cooldown_seconds: 60.0     # per (strategy, symbol)
   regime_short_window: 30
   regime_long_window: 300
-  regime_trend_threshold: 0.30
-  regime_high_vol_ratio: 2.0
-  regime_news_tick_bps: 25.0
+  regime_trend_threshold: 0.60         # loosened from 0.30 (less trigger-happy)
+  regime_high_vol_ratio: 2.5           # loosened from 2.0
+  regime_news_tick_bps: 35.0           # loosened from 25.0
+  regime_soft_veto: true               # shrink instead of drop on wrong regime
+  wrong_regime_size_mult: 0.5
   high_vol_size_mult: 0.5
   daily_loss_pct: 0.10
   daily_window_seconds: 86400.0
-  max_gross_exposure_mult: 2.0
+  max_gross_exposure_mult: 2.0         # × (bankroll × leverage)
 ```
 
 Env-var overrides: `BOT_BRAIN`, `BOT_BRAIN_MIN_WIN_RATE`,
@@ -1098,8 +1297,8 @@ BOT_BRAIN=false python -m scripts.run_delta --bankroll 27 --dashboard
 | **Bankroll** (margin)          | `stake / leverage <= bankroll`            |
 | **Per-trade fraction**         | `largest leg <= max_trade_fraction × buying_power` |
 | **Per-market exposure**        | `existing + new <= max_market_exposure × buying_power` |
-| **Drawdown circuit breaker**   | halt if `drawdown >= max_drawdown` (25%)  |
-| **Loss-streak circuit breaker**| halt after `max_consecutive_losses` (6)   |
+| **Drawdown circuit breaker**   | hard halt if `drawdown >= max_drawdown` (25%) |
+| **Loss-streak cool-down**      | time-limited pause after `max_consecutive_losses` (default 15) for `loss_streak_cooldown_seconds` (default 300s) |
 
 Where `buying_power = bankroll × leverage`. All four caps are leverage-aware,
 so a $20 bankroll at 50× behaves like $1,000 of buying power for sizing
@@ -1124,6 +1323,221 @@ These three knobs interact subtly:
 
 `get_settings()` emits a startup `log.warning` if any of these invariants are
 violated, with a concrete remediation hint.
+
+### Halt vs cool-down (changed in 2026-05)
+
+Earlier versions of the bot treated `max_consecutive_losses` as a
+**hard halt** that required a manual dashboard resume to clear.
+That was the wrong default for a scalper: 6-loss streaks happen
+inside a normal trading session, and the bot would spend the rest
+of the day frozen.
+
+Now the consecutive-loss trigger is a **time-limited cool-down**:
+
+* Default `max_consecutive_losses` raised to **15** (was 6).
+* Hitting it pauses *fresh entries* for
+  `loss_streak_cooldown_seconds` (default **300s = 5 min**).
+* The pause is automatic-clear; no dashboard interaction needed.
+* Vetoed signals are tagged
+  `risk: loss-streak cool-down (<N>s left)` so the dashboard
+  shows the cool-down rather than a silent halt.
+* `max_drawdown` (25%) is still a permanent hard halt — only
+  `resume()` clears it. That ordering is intentional: per-
+  session loss-streaks self-heal, but a 25% drawdown means
+  something is structurally wrong and a human should look.
+
+---
+
+## Offline backtest + ML pipeline
+
+The bot ships with a self-contained offline pipeline that turns
+historical Delta OHLCV into:
+
+* **`data/backtest/sweep_summary.csv`** — leaderboard of every
+  (strategy × symbol × resolution × leverage) configuration ranked
+  by realised PnL, Sharpe, max DD, profit factor, win rate.
+* **`data/backtest/sweep_trades.csv`** — every individual closed
+  round-trip the sweep produced. Used as the training dataset for
+  the ML model.
+* **`data/money_printer/hour_maps.json`** — per-(strategy, symbol)
+  24-bucket profitability map by UTC hour-of-day. Consumed by
+  `MoneyPrinter` as its time-of-day gate.
+* **`data/money_printer/model.joblib`** — a `sklearn` GBT
+  classifier predicting `P(win)` per trade setup. Consumed by
+  `MoneyPrinter` as its ML gate.
+
+The pipeline reuses the **exact same strategy classes** the live
+runner uses; there is no parallel "research" implementation to
+drift out of sync.
+
+### Module layout
+
+| Module                       | Role                                                              |
+| ---------------------------- | ----------------------------------------------------------------- |
+| `aera.data.history`          | `DeltaHistoryClient` (paginated `/v2/history/candles`) + `CandleStore` (Parquet/CSV cache w/ incremental dedupe) + `fetch_history()` convenience wrapper |
+| `aera.backtest.replay`       | `candles_to_market_stream` (4-tick-per-bar synthetic OHLC stream) + `BarReplay` (drives a Strategy through a real `Portfolio`, records every trade as a `TradeRecord`, returns a `BacktestResult` with PnL/Sharpe/max-DD/profit-factor metrics) |
+| `aera.backtest.sweep`        | `SweepConfig` + `run_sweep` — thread-pool grid search; candles cached per (symbol, resolution) and shared across per-leverage replays |
+| `aera.backtest.analysis`     | `HourMap` (24-bucket expectancy by UTC hour) + `build_all_hour_maps`, `write_hour_maps`, `load_hour_maps`, `summarise_results`, `write_summary_csv` |
+| `aera.ml.features`           | `FEATURE_COLUMNS` (15-feature vector: returns × 4 horizons, vol, ATR, RSI, EMA-deviation, wick shapes, sin/cos hour-of-day) + `extract_features` (offline) + `FeatureExtractor` (live rolling-window) + `label_trades` (join-by-timestamp) |
+| `aera.ml.model`              | `ProfitabilityClassifier` wrapping `sklearn.ensemble.HistGradientBoostingClassifier` (`predict_proba_win`, `save`, `load`) + `train_model` (walk-forward 80/20 split, returns `TrainReport`) |
+| `aera.ml.ensemble`           | `EnsembleClassifier` — per-symbol GBT classifiers + a global fallback; routes by symbol at scoring time, falls back when the per-symbol model is missing. `train_ensemble(min_per_symbol=200)` writes a directory layout (`fallback.joblib` + `per_symbol/*.joblib`) |
+| `aera.ml.sequence`           | `SequenceScorer` + `_TransformerWinClassifier` — tiny transformer encoder (~10k params) over the last `seq_len` bars of OHLCV-derived features (`SEQUENCE_FEATURES` — return, log-vol, wicks, body, sin/cos hour). `torch` is an **optional** dependency; if missing, the scorer returns 0.5 (no opinion) and the registry skips it. `train_sequence_model` is walk-forward + per-feature scaler. |
+| `aera.ml.rl`                 | `TradingEnv` (Gym-style env over an OHLCV history; HOLD/BUY/SELL; reward = unrealised-PnL delta + realised-PnL bonus on close) + `DQNAgent` (numpy-only MLP Q-network, experience replay, target net, ε-greedy) + `RLScorer` (registry adapter). No new deps required. |
+| `aera.ml.registry`           | `ModelRegistry.from_dir(...)` auto-discovers whatever artefacts exist on disk (GBT, ensemble, sequence model, RL policy) and exposes `combined(ctx) -> (P(win), per-scorer breakdown)`. Weighted-average fusion with `FusionWeights`. Each scorer implements `available()` so missing-dep scorers silently degrade. |
+
+### The four scripts
+
+```bash
+# 1. fetch_history.py
+#    Cache OHLCV for one or more (symbol, resolution) pairs.
+#    Incremental: subsequent runs only fetch the missing tail.
+python -m scripts.fetch_history \
+    --symbols BTCUSD,ETHUSD,SOLUSD \
+    --resolutions 1m,5m \
+    --days 90
+
+# 2. sweep_backtest.py
+#    Cartesian product over strategies × symbols × resolutions ×
+#    leverages. Writes summary CSV + trades CSV + hour_maps.json.
+python -m scripts.sweep_backtest \
+    --strategies delta_perp_scalper,tick_reversal_scalp,micro_vwap_sniper \
+    --symbols BTCUSD,ETHUSD,SOLUSD \
+    --resolutions 1m,5m \
+    --leverages 5,10,25 \
+    --bankroll 100 \
+    --workers 4
+
+# 3. train_money_printer.py
+#    Fits the ProfitabilityClassifier from the sweep's trade list.
+#    Walk-forward split (last 20% held out). Writes model.joblib +
+#    a training report (accuracy, precision, recall, F1, ROC-AUC,
+#    top feature importances).
+python -m scripts.train_money_printer \
+    --trades-csv data/backtest/sweep_trades.csv \
+    --min-trades 200 \
+    --output data/money_printer/model.joblib
+
+# 4. backtest.py
+#    Single-config sanity backtest for one strategy / symbol /
+#    resolution / leverage. Useful while iterating on a strategy.
+python -m scripts.backtest \
+    --strategy money_printer \
+    --symbol BTCUSD --resolution 5m \
+    --leverage 10 --bankroll 100
+```
+
+### What the ML model sees
+
+The `FEATURE_COLUMNS` list — kept in `aera/ml/features.py` — is
+the single source of truth for what the live `MoneyPrinter`
+extracts and what the trainer feeds the GBT. Adding / removing a
+feature requires retraining; the model's `joblib` payload includes
+the feature schema and will refuse to score against a mismatched
+vector.
+
+Current 15 features (subject to retraining):
+
+| Feature                  | Why                                            |
+| ------------------------ | ---------------------------------------------- |
+| `ret_1`, `ret_3`, `ret_5`, `ret_15` | Multi-horizon momentum / mean-reversion proxy |
+| `vol_10`, `vol_30`       | Rolling realised volatility                    |
+| `atr_pct`                | Average True Range / mid — vol band reference  |
+| `rsi_14`                 | Classic overbought / oversold                  |
+| `ema_dev_20`             | Mean-reversion distance from EMA               |
+| `upper_wick_ratio`, `lower_wick_ratio` | Exhaustion / absorption shapes  |
+| `body_ratio`             | Trend-bar vs. doji                             |
+| `volume_z`               | Volume spike z-score                           |
+| `sin_hour`, `cos_hour`   | Cyclical encoding of UTC hour-of-day           |
+
+### Re-train cadence
+
+* **Always retrain after a strategy logic change.** The model's
+  P(win) predictions are conditional on the strategies that
+  produced the training trades; changing entry logic invalidates
+  the labels.
+* **Weekly cadence in steady state.** Re-fetch the rolling tail
+  (`fetch_history --days 90` is incremental), re-sweep, re-train.
+  The whole pipeline takes ~10 minutes for 3 symbols × 2
+  resolutions on a laptop.
+* **Restart the bot** to pick up a new model — `MoneyPrinter`
+  loads `model.joblib` once at construction.
+
+### Graceful degradation
+
+`MoneyPrinter` is designed to be safe to enable *before* the
+artefacts exist:
+
+* No `hour_maps.json` → no time gate; all hours allowed.
+* No model artefacts at all → no ML gate; falls back to ATR
+  mean-reversion + RSI directional bias (sizing is halved).
+* Both missing → just an ATR-band gated mean-reversion scalper
+  with ATR-tuned exits.
+
+This lets you flip the strategy on first and let it print baseline
+trades while the offline pipeline runs in another terminal.
+
+### Multi-model fusion (the model registry)
+
+Out of the box, MoneyPrinter doesn't depend on any one model — it
+loads **whatever it finds** under `data/money_printer/` via
+`aera.ml.registry.ModelRegistry.from_dir(...)`. The four supported
+scorers and the files that activate them:
+
+| Scorer       | Activates when                                  | Source module           | Extra deps |
+| ------------ | ----------------------------------------------- | ----------------------- | ---------- |
+| `gbt`        | `model.joblib` is present                       | `aera.ml.model`         | (already in `requirements.txt`) |
+| `ensemble`   | `ensemble/` directory exists (`fallback.joblib` + `per_symbol/<SYM>.joblib`) | `aera.ml.ensemble` | none |
+| `sequence`   | `sequence_model.pt` + `.meta.json` present and `torch` is importable | `aera.ml.sequence` | `pip install -r requirements-ml-extras.txt` |
+| `rl`         | `rl_policy.npz` is present                      | `aera.ml.rl`            | none |
+
+At decision time, every available scorer is asked for its
+`P(win)` and the registry returns a **weighted average** (default
+weights: `gbt=1.0`, `ensemble=1.5`, `sequence=0.75`, `rl=0.5`). The
+strategy gates on that fused score against `win_threshold`.
+
+Two consequences worth knowing:
+
+1. **You can train models incrementally.** Start with the GBT
+   alone, train the ensemble later, drop in an RL policy a week
+   after that. MoneyPrinter picks them up on next restart with no
+   code changes.
+2. **Each fire's `metadata['scorers']`** carries the per-scorer
+   breakdown (e.g. `{"gbt": 0.62, "ensemble": 0.71, "rl": 0.55}`),
+   so the dashboard and trade logs show exactly *why* a fire was
+   approved — useful when one scorer goes haywire and you want to
+   yank its weight to zero in `FusionWeights`.
+
+#### Training the extra scorers
+
+After `sweep_backtest.py` has produced `data/backtest/sweep_trades.csv`:
+
+```bash
+# Per-symbol ensemble (sklearn — fast, no torch).
+python -m scripts.train_ensemble \
+    --trades-csv data/backtest/sweep_trades.csv \
+    --history-dir data/history --resolution 5m \
+    --out-dir data/money_printer/ensemble \
+    --min-per-symbol 250
+
+# Transformer encoder over the last 64 bars (requires torch).
+pip install -r requirements-ml-extras.txt
+python -m scripts.train_sequence_model \
+    --trades-csv data/backtest/sweep_trades.csv \
+    --history-dir data/history --resolution 5m \
+    --seq-len 64 --epochs 30 \
+    --out data/money_printer/sequence_model.pt
+
+# DQN trading policy on BTC candles (numpy-only).
+python -m scripts.train_rl_agent \
+    --symbol BTCUSD --resolution 5m \
+    --history-dir data/history \
+    --episodes 30 \
+    --out data/money_printer/rl_policy.npz
+```
+
+All three trainers write a `*_report.json` next to the model with
+hold-out metrics. Reading them is the fastest way to spot a
+broken or under-fit model before it gets fused in live.
 
 ---
 
@@ -1193,7 +1607,7 @@ Flags:
 * `--strategies LIST` — comma-separated, default `delta_perp_scalper`.
   Available: `delta_perp_scalper`, `order_book_sniper`,
   `tick_reversal_scalp`, `bid_ask_spread_fade`, `flow_scalp`,
-  `micro_vwap_sniper`, `stop_hunt_reversal`.
+  `micro_vwap_sniper`, `stop_hunt_reversal`, `money_printer`.
 * `--symbols LIST` — comma-separated, e.g. `BTCUSD,ETHUSD` (override config).
 * `--websocket` — use Delta's WS book feed instead of REST polling.
 * `--live` — route REAL orders.
@@ -1217,6 +1631,102 @@ Pure-math Monte Carlo of bankroll growth under different edge / win-rate /
 Kelly assumptions. No internet, no credentials. Useful for sanity-checking
 whether a configured per-trade edge is plausibly compatible with a chosen
 growth target.
+
+### `python -m scripts.fetch_history`
+
+Fetch and cache OHLCV candles from Delta's `/v2/history/candles`
+endpoint into `data/history/<SYMBOL>/<resolution>.parquet` (CSV
+fallback if `pyarrow` is missing). Incremental: re-running with
+the same `--days` only fetches new bars at the tail.
+
+```bash
+python -m scripts.fetch_history --symbols BTCUSD,ETHUSD --resolutions 1m,5m --days 90
+python -m scripts.fetch_history --symbols SOLUSD --resolutions 5m --days 180
+```
+
+### `python -m scripts.backtest`
+
+Single-configuration backtest. Drives one strategy through one
+(symbol, resolution) with a chosen leverage; prints a
+`BacktestResult` summary (trades, PnL, Sharpe, max DD, win rate,
+profit factor). Useful while iterating on a strategy.
+
+```bash
+python -m scripts.backtest --strategy delta_perp_scalper \
+    --symbol BTCUSD --resolution 5m --leverage 10 --bankroll 100
+```
+
+### `python -m scripts.sweep_backtest`
+
+Cartesian-product grid backtest across strategies × symbols ×
+resolutions × leverages, in a `ThreadPoolExecutor`. Outputs:
+
+* `data/backtest/sweep_summary.csv` — ranked leaderboard,
+* `data/backtest/sweep_trades.csv` — every trade ever taken,
+* `data/money_printer/hour_maps.json` — per-(strategy, symbol)
+  hour-of-day expectancy map consumed by `MoneyPrinter`.
+
+```bash
+python -m scripts.sweep_backtest \
+    --strategies delta_perp_scalper,tick_reversal_scalp,micro_vwap_sniper \
+    --symbols BTCUSD,ETHUSD,SOLUSD --resolutions 1m,5m \
+    --leverages 5,10,25 --bankroll 100 --workers 4
+```
+
+### `python -m scripts.train_money_printer`
+
+Fits the `ProfitabilityClassifier` from the sweep's
+`sweep_trades.csv`. Walk-forward 80/20 split, prints a training
+report (accuracy, precision, recall, F1, ROC-AUC, top feature
+importances), writes `data/money_printer/model.joblib`.
+
+```bash
+python -m scripts.train_money_printer \
+    --trades-csv data/backtest/sweep_trades.csv \
+    --min-trades 200
+```
+
+### `python -m scripts.train_ensemble`
+
+Fits the per-symbol ensemble — one
+`HistGradientBoostingClassifier` per symbol with at least
+`--min-per-symbol` trades, plus a global fallback. Writes
+`data/money_printer/ensemble/` (a directory the registry
+auto-discovers).
+
+```bash
+python -m scripts.train_ensemble \
+    --trades-csv data/backtest/sweep_trades.csv \
+    --history-dir data/history --resolution 5m \
+    --min-per-symbol 250
+```
+
+### `python -m scripts.train_sequence_model`
+
+Fits the tiny transformer encoder (`aera.ml.sequence`) over the
+last `--seq-len` bars. **Requires torch** (`pip install -r
+requirements-ml-extras.txt`). Walk-forward split with per-feature
+scaler; writes `data/money_printer/sequence_model.pt` + meta.
+
+```bash
+python -m scripts.train_sequence_model \
+    --trades-csv data/backtest/sweep_trades.csv \
+    --history-dir data/history --resolution 5m \
+    --seq-len 64 --epochs 30 --d-model 32 --n-heads 4
+```
+
+### `python -m scripts.train_rl_agent`
+
+Trains the DQN trading agent (`aera.ml.rl`) on one symbol's
+candle history. Numpy-only; no torch. Writes
+`data/money_printer/rl_policy.npz`.
+
+```bash
+python -m scripts.train_rl_agent \
+    --symbol BTCUSD --resolution 5m \
+    --history-dir data/history \
+    --episodes 30 --hidden 32
+```
 
 ---
 
@@ -1268,7 +1778,11 @@ break the bot.
 The bot will refuse to start `--live` if credentials are missing. The
 `RiskManager`'s drawdown halt will hard-stop trading if equity falls 25% from
 peak — that's a feature, not a bug. The brain's daily-loss circuit-breaker
-(default 10%) trips before that for a graceful single-session halt.
+(default 10%) trips before that for a graceful single-session halt, and a
+**time-limited loss-streak cool-down** (default: pause for 5 min after 15
+consecutive losses) sits between them. The brain's per-(strategy, symbol)
+post-loss cool-down (default 60 s) catches single losing trades before they
+escalate into a streak in the first place.
 
 ---
 
@@ -1278,26 +1792,36 @@ peak — that's a feature, not a bug. The brain's daily-loss circuit-breaker
 python -m pytest -q
 ```
 
-Tests cover portfolio bookkeeping under leveraged + non-leveraged
-fills, risk vet logic (including the reduce-only bypass), executor sizing
-(target mode + legacy mode, leverage-aware), the Delta client + signing +
-websocket, the mean-reversion scalper (entries, exits, USD and pct TP/SL,
-precedence rules, debouncing), the Order Book Sniper (depth-imbalance +
-tape confirmation + wall-vanish spoof exit + hold-timeout + TP/SL
-priority), the Tick Reversal Scalp (5-tick exhaustion detection, size
-decay, spread / news / volume filters, depth-trend gate, all exit
-paths), the Bid-Ask Spread Fade (quote pricing, fee + spread gates,
-kill switch, inventory skew + cap, refresh-rate gate, independent
-BUY/SELL emission), the Micro VWAP Reversion Sniper (VWAPStream
-math, volume drop-off ratio, deviation + spread + hour-skip gates,
-VWAP snap-back / hard SL / hold-timeout / USD-PnL exits), the
-Stop Hunt / Liquidity Grab Reversal (BarStream rotation +
-inferred-volume + fractal swing pivots, wick depth / body ratio /
-volume / delta gates, partial TP1 + final TP2 + wick-anchored stop +
-hold-timeout exits, rearm debounce), the Greedy autopilot
-(`fees + $1` TP math, trailing ratchet, win/loss-streak leverage
-ramp, compounding fraction, per-market cap bypass for fresh entries),
-the dashboard state container + FastAPI routes, Kelly + compounding
+**397 tests, all green.** They cover portfolio bookkeeping under
+leveraged + non-leveraged fills, risk vet logic (including the
+reduce-only bypass), executor sizing (target mode + legacy mode,
+leverage-aware), the Delta client + signing + websocket, the
+mean-reversion scalper (entries, exits, USD and pct TP/SL,
+precedence rules, debouncing), the Order Book Sniper (depth-
+imbalance + tape confirmation + wall-vanish spoof exit + hold-
+timeout + TP/SL priority), the Tick Reversal Scalp (5-tick
+exhaustion detection, size decay, spread / news / volume filters,
+depth-trend gate, all exit paths), the Bid-Ask Spread Fade (quote
+pricing, fee + spread gates, kill switch, inventory skew + cap,
+refresh-rate gate, independent BUY/SELL emission), the Micro VWAP
+Reversion Sniper (VWAPStream math, volume drop-off ratio,
+deviation + spread + hour-skip gates, VWAP snap-back / hard SL /
+hold-timeout / USD-PnL exits), the Stop Hunt / Liquidity Grab
+Reversal (BarStream rotation + inferred-volume + fractal swing
+pivots, wick depth / body ratio / volume / delta gates, partial
+TP1 + final TP2 + wick-anchored stop + hold-timeout exits, rearm
+debounce), the Greedy autopilot (`fees + $1` TP math, trailing
+ratchet, win/loss-streak leverage ramp, compounding fraction,
+per-market cap bypass for fresh entries), the Adaptive Brain
+(performance gate, soft + hard regime veto, leverage-aware
+gross-exposure cap, post-loss cool-down, daily-loss tagging,
+phantom-position reconciliation), the new Risk loss-streak
+cool-down (vs. permanent halt), the historical `CandleStore`
+(Parquet write + incremental dedupe), the `BarReplay` backtest
+engine + synthetic 4-tick-per-bar stream, ML feature extraction
++ trade labelling, the `MoneyPrinter` strategy (hour / ATR / ML
+gates, ATR-tuned exits, graceful artefact degradation), the
+dashboard state container + FastAPI routes, Kelly + compounding
 math, and the order book primitives.
 
 ---
@@ -1310,10 +1834,10 @@ Bug reports, questions, and PRs are welcome on GitHub:
 * Pull requests: <https://github.com/manishhansal/aera/pulls>
 
 Before opening a PR, please run the test suite locally
-(`python -m pytest -q`, 314 tests should pass) and read
+(`python -m pytest -q`, 397 tests should pass) and read
 [`CONTEXT.md`](./CONTEXT.md) — it documents the signal-to-fill
-pipeline, the risk-cap invariants, and the conventions every new
-strategy must follow.
+pipeline, the offline backtest + ML pipeline, the risk-cap
+invariants, and the conventions every new strategy must follow.
 
 ---
 
